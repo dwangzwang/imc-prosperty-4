@@ -15,7 +15,7 @@ class Strategy:
         self.product = product
         self.position_limit = position_limit
 
-    def get_orders(self, depth: OrderDepth, position: int) -> List[Order]:
+    def get_orders(self, depth: OrderDepth, position: int, timestamp: int) -> List[Order]:
         """Override this in each product subclass."""
         raise NotImplementedError(f"{self.__class__.__name__} must implement get_orders()")
 
@@ -40,7 +40,7 @@ class EmeraldsStrategy(Strategy):
     def __init__(self):
         super().__init__("EMERALDS", position_limit=80)
 
-    def get_orders(self, depth: OrderDepth, position: int) -> List[Order]:
+    def get_orders(self, depth: OrderDepth, position: int, timestamp: int) -> List[Order]:
         orders: List[Order] = []
         buy_cap  =  self.position_limit - position
         sell_cap =  self.position_limit + position
@@ -87,6 +87,70 @@ class EmeraldsStrategy(Strategy):
 
         return orders
 
+# ══════════════════════════════════════════════════════════════════════════════
+# INTARAN_PEPPER_ROOT  (Rainforest Resin with linear growth)
+# True fair value = 10,000 + (day+2) * 1,000 + timestamp/1000.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class IntaranPepperRootStrategy(Strategy):
+    # ── Tune these ──────────────────────────────────────────────────────────
+    SKEW_THRESHOLD  = 60     # flatten inventory when |position| exceeds this
+    PASSIVE_SPREAD  = 1      # fallback spread from fair value if book is thin
+    MAX_PASSIVE_QTY = 25     # max qty per passive resting quote
+    # ────────────────────────────────────────────────────────────────────────
+
+    def __init__(self):
+        super().__init__("INTARAN_PEPPER_ROOT", position_limit=80)
+
+    def get_orders(self, depth: OrderDepth, position: int, timestamp:int) -> List[Order]:
+        self.FAIR_VALUE = 13_000 + timestamp/1000
+
+        orders: List[Order] = []
+        buy_cap  =  self.position_limit - position
+        sell_cap =  self.position_limit + position
+
+        # Step 1: Take any resting orders that give positive edge
+        for ask in sorted(depth.sell_orders):
+            if ask >= self.FAIR_VALUE:
+                break
+            qty = min(-depth.sell_orders[ask], buy_cap)
+            if qty > 0:
+                print(f"[INTARAN_PEPPER_ROOT] TAKE BUY  {qty}x @ {ask}")
+                orders.append(self.order(ask, qty))
+                buy_cap -= qty
+
+        for bid in sorted(depth.buy_orders, reverse=True):
+            if bid <= self.FAIR_VALUE:
+                break
+            qty = min(depth.buy_orders[bid], sell_cap)
+            if qty > 0:
+                print(f"[INTARAN_PEPPER_ROOT] TAKE SELL {qty}x @ {bid}")
+                orders.append(self.order(bid, -qty))
+                sell_cap -= qty
+
+        # Step 2: Post passive quotes just inside the existing best bid/ask
+        best_bid = max(depth.buy_orders,  default=self.FAIR_VALUE - self.PASSIVE_SPREAD)
+        best_ask = min(depth.sell_orders, default=self.FAIR_VALUE + self.PASSIVE_SPREAD)
+
+        our_bid = min(best_bid + 1, self.FAIR_VALUE - 1)
+        our_ask = max(best_ask - 1, self.FAIR_VALUE + 1)
+
+        if (qty := min(self.MAX_PASSIVE_QTY, buy_cap)) > 0:
+            print(f"[EMERALDS] PASSIVE BID {qty}x @ {our_bid}")
+            orders.append(self.order(our_bid, qty))
+
+        if (qty := min(self.MAX_PASSIVE_QTY, sell_cap)) > 0:
+            print(f"[EMERALDS] PASSIVE ASK {qty}x @ {our_ask}")
+            orders.append(self.order(our_ask, -qty))
+
+        # Step 3: Flatten if inventory is too skewed
+        if abs(position) > self.SKEW_THRESHOLD:
+            flatten = -position
+            print(f"[EMERALDS] FLATTEN {flatten}x @ {self.FAIR_VALUE}  (was {position})")
+            orders.append(self.order(self.FAIR_VALUE, flatten))
+
+        return orders
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # KELP STRATEGY  (applied to TOMATOES)
@@ -101,7 +165,7 @@ class KelpStrategy(Strategy):
     MAX_PASSIVE_QTY = 20     # max qty per passive resting quote
     # ────────────────────────────────────────────────────────────────────────
 
-    def __init__(self, product: str, position_limit: int):
+    def __init__(self, product: str, position_limit: int, timestamp: int):
         super().__init__(product, position_limit)
 
     def _wall_mid_2x(self, depth: OrderDepth) -> int:
@@ -188,6 +252,7 @@ class KelpStrategy(Strategy):
 STRATEGIES: Dict[str, Strategy] = {
     "EMERALDS": EmeraldsStrategy(),
     "TOMATOES": KelpStrategy("TOMATOES", position_limit=80),
+    "INTARAN_PEPPER_ROOT": IntaranPepperRootStrategy(),
 }
 
 
@@ -205,6 +270,7 @@ class Trader:
                 continue
             depth    = state.order_depths[product]
             position = state.position.get(product, 0)
-            result[product] = strategy.get_orders(depth, position)
+            timestamp = state.timestamp
+            result[product] = strategy.get_orders(depth, position, timestamp)
 
         return result, 0, ""
