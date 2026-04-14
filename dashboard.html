@@ -1,5 +1,3 @@
-<!-- run python3 -m http.server 8765 to start the server-->
-<!-- go to http://localhost:8765/dashboard.html to see the dashboard -->
 <!DOCTYPE html>
 <html lang="en">
 
@@ -36,7 +34,6 @@
       min-height: 100vh;
     }
 
-    /* ── Header ─────────────────────────────── */
     header {
       display: flex;
       align-items: center;
@@ -109,12 +106,6 @@
       opacity: .9;
     }
 
-    button.primary:disabled {
-      opacity: .4;
-      cursor: default;
-    }
-
-    /* ── Stat Cards ─────────────────────────── */
     .stats-row {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -153,15 +144,6 @@
       margin-top: 4px;
     }
 
-    .stat-pos {
-      color: var(--accent2);
-    }
-
-    .stat-neg {
-      color: var(--accent4);
-    }
-
-    /* ── Charts ─────────────────────────────── */
     .charts-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -188,6 +170,7 @@
       display: flex;
       align-items: center;
       gap: 8px;
+      flex-wrap: wrap;
     }
 
     .badge {
@@ -204,7 +187,6 @@
       display: block;
     }
 
-    /* ── Trades Table ───────────────────────── */
     .table-section {
       padding: 0 32px 32px;
     }
@@ -275,7 +257,6 @@
       font-weight: 600;
     }
 
-    /* ── Loading / Empty ───────────────────── */
     .loading {
       display: flex;
       align-items: center;
@@ -301,7 +282,21 @@
       }
     }
 
-    /* ── Responsive ─────────────────────────── */
+    .status-msg {
+      font-size: 12px;
+      padding: 6px 12px;
+      border-radius: 6px;
+      background: rgba(239, 68, 68, .12);
+      color: #ef4444;
+      border: 1px solid rgba(239, 68, 68, .3);
+    }
+
+    .status-msg.ok {
+      background: rgba(16, 185, 129, .12);
+      color: #10b981;
+      border-color: rgba(16, 185, 129, .3);
+    }
+
     @media (max-width: 768px) {
       .charts-grid {
         grid-template-columns: 1fr;
@@ -334,18 +329,14 @@
       <h1>IMC <span>Prosperity</span> — Dashboard</h1>
     </div>
     <div class="controls">
-      <select id="roundSelect" onchange="loadData()">
-        <option value="TUTORIAL_ROUND_1">Tutorial Round 1</option>
-      </select>
+      <select id="roundSelect" onchange="onRoundChange()"></select>
       <select id="daySelect" onchange="loadData()"></select>
-      <select id="productSelect">
-        <option value="ALL">All Products</option>
-      </select>
+      <select id="orderBookProduct"></select>
+      <span id="statusMsg" class="status-msg" style="display:none"></span>
     </div>
   </header>
 
-  <!-- Stat Cards -->
-  <div class="stats-row" id="statsRow">
+  <div class="stats-row">
     <div class="stat-card">
       <div class="stat-label">Products</div>
       <div class="stat-value" id="statProducts">—</div>
@@ -372,46 +363,65 @@
     </div>
   </div>
 
-  <!-- Charts -->
   <div class="charts-grid">
+    <!-- MAIN: Order book for selected product -->
     <div class="chart-card wide">
-      <div class="chart-title">📉 Mid Price Over Time <span class="badge" id="priceChartBadge">—</span></div>
-      <canvas id="priceChart" height="100"></canvas>
-      <div class="loading" id="priceLoading">
+      <div class="chart-title">
+        📋 Order Book — Bid &amp; Ask Levels Over Time
+        <span class="badge" id="orderBookBadge">select a product</span>
+      </div>
+      <canvas id="orderBookChart" height="110"></canvas>
+      <div class="loading" id="orderBookLoading">
         <div class="spinner"></div><span>Load data to begin</span>
       </div>
     </div>
+
+    <!-- Mid price (all products, smaller) -->
+    <div class="chart-card">
+      <div class="chart-title">📉 Mid Price — All Products <span class="badge" id="priceChartBadge">—</span></div>
+      <canvas id="priceChart" height="160"></canvas>
+      <div class="loading" id="priceLoading">
+        <div class="spinner" style="display:none"></div><span>Load data to begin</span>
+      </div>
+    </div>
+
+    <!-- Spread -->
     <div class="chart-card">
       <div class="chart-title">📊 Bid / Ask Spread Over Time</div>
-      <canvas id="spreadChart" height="140"></canvas>
+      <canvas id="spreadChart" height="160"></canvas>
       <div class="loading" id="spreadLoading">
         <div class="spinner" style="display:none"></div><span>Load data to begin</span>
       </div>
     </div>
+
+    <!-- Trade histogram -->
     <div class="chart-card">
       <div class="chart-title">💹 Trade Price Distribution</div>
-      <canvas id="tradeHistChart" height="140"></canvas>
+      <canvas id="tradeHistChart" height="160"></canvas>
       <div class="loading" id="tradeHistLoading">
         <div class="spinner" style="display:none"></div><span>Load data to begin</span>
       </div>
     </div>
+
+    <!-- Volume -->
     <div class="chart-card">
       <div class="chart-title">📦 Trade Volume Over Time</div>
-      <canvas id="volumeChart" height="140"></canvas>
+      <canvas id="volumeChart" height="160"></canvas>
       <div class="loading" id="volumeLoading">
         <div class="spinner" style="display:none"></div><span>Load data to begin</span>
       </div>
     </div>
+
+    <!-- PnL -->
     <div class="chart-card">
       <div class="chart-title">🏷️ PnL Over Time</div>
-      <canvas id="pnlChart" height="140"></canvas>
+      <canvas id="pnlChart" height="160"></canvas>
       <div class="loading" id="pnlLoading">
         <div class="spinner" style="display:none"></div><span>Load data to begin</span>
       </div>
     </div>
   </div>
 
-  <!-- Trades Table -->
   <div class="table-section">
     <div class="table-card">
       <div class="table-header">
@@ -434,31 +444,64 @@
   </div>
 
   <script>
-    // ────────────────────────────────────────────────────────────────────
-    // State
-    // ────────────────────────────────────────────────────────────────────
-    let priceData = [];     // parsed rows from prices CSV
-    let tradeData = [];     // parsed rows from trades CSV
-    let charts = {};        // Chart.js instances
+    // ── State ────────────────────────────────────────────────────────────
+    let priceData = [];
+    let tradeData = [];
+    let charts = {};
 
-    const PALETTE = [
-      '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'
-    ];
+    // ── Known rounds + day ranges. Add new rounds/days here or rely on auto-probe ──
+    // Structure: { roundKey: { label, days: [list of day strings to probe] } }
+    const ROUND_CONFIG = {
+      TUTORIAL_ROUND_1: { label: 'Tutorial Round 0', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
+      ROUND1: { label: 'Round 1', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
+      ROUND2: { label: 'Round 2', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
+      ROUND3: { label: 'Round 3', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
+      ROUND4: { label: 'Round 4', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
+      ROUND5: { label: 'Round 5', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
+    };
 
-    // ────────────────────────────────────────────────────────────────────
-    // Day selector — built from known file names
-    // ────────────────────────────────────────────────────────────────────
-    const DAYS = ['-1', '-2'];
-    const daySelect = document.getElementById('daySelect');
-    DAYS.forEach(d => {
+    const PALETTE = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
+
+    // ── Build round selector ─────────────────────────────────────────────
+    const roundSelect = document.getElementById('roundSelect');
+    Object.entries(ROUND_CONFIG).forEach(([key, cfg]) => {
       const o = document.createElement('option');
-      o.value = d; o.textContent = `Day ${d}`;
-      daySelect.appendChild(o);
+      o.value = key; o.textContent = cfg.label;
+      roundSelect.appendChild(o);
     });
 
-    // ────────────────────────────────────────────────────────────────────
-    // CSV parser (semicolon or comma)
-    // ────────────────────────────────────────────────────────────────────
+    // ── On round change: probe which days actually exist, then load ──────
+    async function onRoundChange() {
+      const round = roundSelect.value;
+      const daySelect = document.getElementById('daySelect');
+      daySelect.innerHTML = '<option disabled>Scanning…</option>';
+
+      const candidates = ROUND_CONFIG[round]?.days ?? ['-2', '-1', '0', '1', '2', '3'];
+      const available = [];
+      await Promise.all(candidates.map(async d => {
+        const url = `data/${round}/prices_round_1_day_${d}.csv`;
+        try {
+          const r = await fetch(url, { method: 'HEAD' });
+          if (r.ok) available.push(d);
+        } catch (_) { }
+      }));
+      available.sort((a, b) => +a - +b);
+
+      daySelect.innerHTML = '';
+      if (!available.length) {
+        const o = document.createElement('option');
+        o.textContent = 'No days found'; daySelect.appendChild(o);
+        showStatus('No data files found for this round', false);
+        return;
+      }
+      available.forEach(d => {
+        const o = document.createElement('option');
+        o.value = d; o.textContent = `Day ${d}`; daySelect.appendChild(o);
+      });
+      loadData();
+    }
+
+    // ── CSV parser ───────────────────────────────────────────────────────
     function parseCSV(text) {
       const lines = text.trim().split('\n');
       const sep = lines[0].includes(';') ? ';' : ',';
@@ -471,66 +514,77 @@
       });
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // Load both CSVs from the server
-    // ────────────────────────────────────────────────────────────────────
+    // ── Load CSVs ────────────────────────────────────────────────────────
     async function loadData() {
-      const round = document.getElementById('roundSelect').value;
+      const round = roundSelect.value;
       const day = document.getElementById('daySelect').value;
+      if (!day || day === 'Scanning…') return;
 
       showLoadingSpinners(true);
+      showStatus('', null);
 
       try {
         const base = `data/${round}`;
-        const suffix = `round_0_day_${day}.csv`;
-
+        const suffix = `round_1_day_${day}.csv`;
         const [priceText, tradeText] = await Promise.all([
-          fetch(`${base}/prices_${suffix}`).then(r => { if (!r.ok) throw new Error('prices not found'); return r.text(); }),
-          fetch(`${base}/trades_${suffix}`).then(r => { if (!r.ok) throw new Error('trades not found'); return r.text(); }),
+          fetch(`${base}/prices_${suffix}`).then(r => { if (!r.ok) throw new Error('prices_' + suffix + ' not found'); return r.text(); }),
+          fetch(`${base}/trades_${suffix}`).then(r => { if (!r.ok) throw new Error('trades_' + suffix + ' not found'); return r.text(); }),
         ]);
-
         priceData = parseCSV(priceText);
         tradeData = parseCSV(tradeText);
-
-        populateProductFilter();
+        showStatus(`Loaded ${priceData.length.toLocaleString()} price rows, ${tradeData.length.toLocaleString()} trades`, true);
+        populateProductFilters();
         updateStats();
         renderAllCharts();
         renderTradeTable();
       } catch (e) {
-        alert('Error loading data: ' + e.message + '\n\nMake sure you are serving this file from the project root (e.g. python -m http.server 8765)');
+        showStatus(e.message, false);
+        showLoadingSpinners(false);
       }
     }
 
+    function showStatus(msg, ok) {
+      const el = document.getElementById('statusMsg');
+      if (!msg) { el.style.display = 'none'; return; }
+      el.textContent = msg;
+      el.className = 'status-msg' + (ok ? ' ok' : '');
+      el.style.display = 'inline-block';
+    }
+
     function showLoadingSpinners(show) {
-      ['priceLoading', 'spreadLoading', 'tradeHistLoading', 'volumeLoading', 'pnlLoading'].forEach(id => {
+      ['orderBookLoading', 'priceLoading', 'spreadLoading', 'tradeHistLoading', 'volumeLoading', 'pnlLoading'].forEach(id => {
         const el = document.getElementById(id);
-        if (el) {
-          el.style.display = show ? 'flex' : 'none';
-          const sp = el.querySelector('.spinner');
-          if (sp) sp.style.display = show ? 'block' : 'none';
-        }
+        if (!el) return;
+        el.style.display = show ? 'flex' : 'none';
+        const sp = el.querySelector('.spinner');
+        if (sp) sp.style.display = show ? 'block' : 'none';
       });
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // Populate product filters
-    // ────────────────────────────────────────────────────────────────────
-    function populateProductFilter() {
+    // ── Populate product filters ──────────────────────────────────────────
+    function populateProductFilters() {
       const products = [...new Set(priceData.map(r => r.product))].filter(Boolean);
 
-      [document.getElementById('productSelect'), document.getElementById('tableProductFilter')].forEach(sel => {
-        sel.innerHTML = '<option value="ALL">All Products</option>';
-        products.forEach(p => {
-          const o = document.createElement('option');
-          o.value = p; o.textContent = p;
-          sel.appendChild(o);
-        });
+      // Order book product selector (header) — no "ALL" option
+      const obSel = document.getElementById('orderBookProduct');
+      const prevOb = obSel.value;
+      obSel.innerHTML = '';
+      products.forEach(p => {
+        const o = document.createElement('option');
+        o.value = p; o.textContent = p; obSel.appendChild(o);
+      });
+      if (products.includes(prevOb)) obSel.value = prevOb;
+
+      // Table product filter
+      const tSel = document.getElementById('tableProductFilter');
+      tSel.innerHTML = '<option value="ALL">All Products</option>';
+      products.forEach(p => {
+        const o = document.createElement('option');
+        o.value = p; o.textContent = p; tSel.appendChild(o);
       });
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // Stats
-    // ────────────────────────────────────────────────────────────────────
+    // ── Stats ─────────────────────────────────────────────────────────────
     function updateStats() {
       const products = [...new Set(priceData.map(r => r.product))].filter(Boolean);
       document.getElementById('statProducts').textContent = products.length;
@@ -538,39 +592,31 @@
       document.getElementById('statTrades').textContent = tradeData.length.toLocaleString();
 
       const mids = priceData.map(r => parseFloat(r.mid_price)).filter(v => !isNaN(v));
-      const avg = mids.length ? (mids.reduce((a, b) => a + b, 0) / mids.length).toFixed(1) : '—';
-      document.getElementById('statAvgMid').textContent = avg;
+      document.getElementById('statAvgMid').textContent = mids.length
+        ? (mids.reduce((a, b) => a + b, 0) / mids.length).toFixed(1) : '—';
 
       const spreads = priceData.map(r => {
         const a = parseFloat(r.ask_price_1), b = parseFloat(r.bid_price_1);
         return (!isNaN(a) && !isNaN(b)) ? a - b : NaN;
       }).filter(v => !isNaN(v));
-      const avgSpread = spreads.length ? (spreads.reduce((a, b) => a + b, 0) / spreads.length).toFixed(1) : '—';
-      document.getElementById('statSpread').textContent = avgSpread;
+      document.getElementById('statSpread').textContent = spreads.length
+        ? (spreads.reduce((a, b) => a + b, 0) / spreads.length).toFixed(1) : '—';
 
       const vol = tradeData.reduce((s, r) => s + (parseFloat(r.quantity) || 0), 0);
       document.getElementById('statVolume').textContent = vol.toLocaleString();
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // Chart helpers
-    // ────────────────────────────────────────────────────────────────────
-    function destroyChart(id) {
-      if (charts[id]) { charts[id].destroy(); delete charts[id]; }
-    }
+    // ── Chart helpers ─────────────────────────────────────────────────────
+    function destroyChart(id) { if (charts[id]) { charts[id].destroy(); delete charts[id]; } }
 
     const CHART_DEFAULTS = {
       responsive: true,
-      animation: { duration: 600, easing: 'easeInOutQuart' },
+      animation: { duration: 400, easing: 'easeInOutQuart' },
       plugins: {
         legend: { labels: { color: '#94a3b8', font: { family: 'Inter', size: 11 }, boxWidth: 12 } },
         tooltip: {
-          backgroundColor: '#1e293b',
-          borderColor: '#334155',
-          borderWidth: 1,
-          titleColor: '#e2e8f0',
-          bodyColor: '#94a3b8',
-          padding: 10,
+          backgroundColor: '#1e293b', borderColor: '#334155', borderWidth: 1,
+          titleColor: '#e2e8f0', bodyColor: '#94a3b8', padding: 10,
         }
       },
       scales: {
@@ -582,18 +628,17 @@
     function mergeDeep(target, source) {
       const out = Object.assign({}, target);
       for (const k in source) {
-        if (source[k] && typeof source[k] === 'object' && !Array.isArray(source[k])) {
+        if (source[k] && typeof source[k] === 'object' && !Array.isArray(source[k]))
           out[k] = mergeDeep(target[k] || {}, source[k]);
-        } else { out[k] = source[k]; }
+        else out[k] = source[k];
       }
       return out;
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // Render ALL charts
-    // ────────────────────────────────────────────────────────────────────
+    // ── Render all charts ─────────────────────────────────────────────────
     function renderAllCharts() {
       showLoadingSpinners(false);
+      renderOrderBookChart();
       renderPriceChart();
       renderSpreadChart();
       renderTradeHistChart();
@@ -601,38 +646,141 @@
       renderPnlChart();
     }
 
-    // 1) Mid Price Over Time (one line per product)
+    // 0) ORDER BOOK — main wide chart for one product ──────────────────────
+    function renderOrderBookChart() {
+      destroyChart('orderBook');
+      const product = document.getElementById('orderBookProduct').value;
+      if (!product) return;
+
+      const canvas = document.getElementById('orderBookChart');
+      canvas.style.display = 'block';
+
+      document.getElementById('orderBookBadge').textContent = product;
+
+      const rows = priceData.filter(r => r.product === product);
+      const SAMPLE = Math.max(1, Math.floor(rows.length / 2000));
+
+      // Collect all bid/ask levels present in the data
+      const bidKeys = [], askKeys = [];
+      for (let i = 1; i <= 3; i++) {
+        if (rows.some(r => r[`bid_price_${i}`] && r[`bid_price_${i}`] !== '')) bidKeys.push(i);
+        if (rows.some(r => r[`ask_price_${i}`] && r[`ask_price_${i}`] !== '')) askKeys.push(i);
+      }
+
+      const datasets = [];
+
+      // Best bid (level 1) — filled area
+      datasets.push({
+        label: 'Best Bid',
+        data: rows.filter((_, idx) => idx % SAMPLE === 0).map(r => ({
+          x: parseInt(r.timestamp) || 0,
+          y: parseFloat(r.bid_price_1) || null
+        })),
+        borderColor: '#10b981',
+        backgroundColor: 'rgba(16,185,129,0.08)',
+        fill: false,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.1,
+        order: 10,
+      });
+
+      // Best ask (level 1) — filled area
+      datasets.push({
+        label: 'Best Ask',
+        data: rows.filter((_, idx) => idx % SAMPLE === 0).map(r => ({
+          x: parseInt(r.timestamp) || 0,
+          y: parseFloat(r.ask_price_1) || null
+        })),
+        borderColor: '#ef4444',
+        backgroundColor: 'rgba(239,68,68,0.08)',
+        fill: false,
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.1,
+        order: 9,
+      });
+
+      // Mid price overlay
+      datasets.push({
+        label: 'Mid Price',
+        data: rows.filter((_, idx) => idx % SAMPLE === 0).map(r => ({
+          x: parseInt(r.timestamp) || 0,
+          y: parseFloat(r.mid_price) || null
+        })),
+        borderColor: '#f59e0b',
+        backgroundColor: 'transparent',
+        borderWidth: 1.5,
+        borderDash: [4, 3],
+        pointRadius: 0,
+        tension: 0.1,
+        order: 8,
+      });
+
+      // Deeper levels (dimmer)
+      bidKeys.slice(1).forEach((lvl, i) => {
+        datasets.push({
+          label: `Bid L${lvl}`,
+          data: rows.filter((_, idx) => idx % SAMPLE === 0).map(r => ({
+            x: parseInt(r.timestamp) || 0,
+            y: parseFloat(r[`bid_price_${lvl}`]) || null
+          })),
+          borderColor: `rgba(16,185,129,${0.35 - i * 0.1})`,
+          backgroundColor: 'transparent',
+          borderWidth: 1,
+          pointRadius: 0,
+          tension: 0.1,
+        });
+      });
+      askKeys.slice(1).forEach((lvl, i) => {
+        datasets.push({
+          label: `Ask L${lvl}`,
+          data: rows.filter((_, idx) => idx % SAMPLE === 0).map(r => ({
+            x: parseInt(r.timestamp) || 0,
+            y: parseFloat(r[`ask_price_${lvl}`]) || null
+          })),
+          borderColor: `rgba(239,68,68,${0.35 - i * 0.1})`,
+          backgroundColor: 'transparent',
+          borderWidth: 1,
+          pointRadius: 0,
+          tension: 0.1,
+        });
+      });
+
+      charts.orderBook = new Chart(canvas, {
+        type: 'line',
+        data: { datasets },
+        options: mergeDeep(CHART_DEFAULTS, {
+          scales: {
+            x: { type: 'linear', title: { display: true, text: 'Timestamp', color: '#475569' } },
+            y: { title: { display: true, text: 'Price', color: '#475569' } }
+          }
+        })
+      });
+    }
+
+    // 1) Mid Price — all products, smaller ─────────────────────────────────
     function renderPriceChart() {
       destroyChart('price');
       const canvas = document.getElementById('priceChart');
       canvas.style.display = 'block';
-
       const products = [...new Set(priceData.map(r => r.product))].filter(Boolean);
-      const selectedProduct = document.getElementById('productSelect').value;
-      const prods = selectedProduct === 'ALL' ? products : [selectedProduct];
+      const SAMPLE = Math.max(1, Math.floor(priceData.length / (products.length * 800)));
 
-      // Sample down for performance — pick every Nth row per product
-      const SAMPLE = 5;
-
-      const datasets = prods.map((p, i) => {
-        const rows = priceData.filter(r => r.product === p)
-          .filter((_, idx) => idx % SAMPLE === 0);
+      const datasets = products.map((p, i) => {
+        const rows = priceData.filter(r => r.product === p).filter((_, idx) => idx % SAMPLE === 0);
         return {
           label: p,
           data: rows.map(r => ({ x: parseInt(r.timestamp) || 0, y: parseFloat(r.mid_price) })),
           borderColor: PALETTE[i % PALETTE.length],
           backgroundColor: 'transparent',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.3,
+          borderWidth: 1.5, pointRadius: 0, tension: 0.3,
         };
       });
 
-      document.getElementById('priceChartBadge').textContent = `${prods.length} product(s)`;
-
+      document.getElementById('priceChartBadge').textContent = `${products.length} product(s)`;
       charts.price = new Chart(canvas, {
-        type: 'line',
-        data: { datasets },
+        type: 'line', data: { datasets },
         options: mergeDeep(CHART_DEFAULTS, {
           scales: {
             x: { type: 'linear', title: { display: true, text: 'Timestamp', color: '#475569' } },
@@ -642,18 +790,16 @@
       });
     }
 
-    // 2) Bid/Ask Spread Over Time
+    // 2) Spread ────────────────────────────────────────────────────────────
     function renderSpreadChart() {
       destroyChart('spread');
       const canvas = document.getElementById('spreadChart');
       canvas.style.display = 'block';
-
       const products = [...new Set(priceData.map(r => r.product))].filter(Boolean);
       const SAMPLE = 5;
 
       const datasets = products.map((p, i) => {
-        const rows = priceData.filter(r => r.product === p)
-          .filter((_, idx) => idx % SAMPLE === 0);
+        const rows = priceData.filter(r => r.product === p).filter((_, idx) => idx % SAMPLE === 0);
         return {
           label: p,
           data: rows.map(r => {
@@ -662,15 +808,12 @@
           }),
           borderColor: PALETTE[i % PALETTE.length],
           backgroundColor: 'transparent',
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.2,
+          borderWidth: 1.5, pointRadius: 0, tension: 0.2,
         };
       });
 
       charts.spread = new Chart(canvas, {
-        type: 'line',
-        data: { datasets },
+        type: 'line', data: { datasets },
         options: mergeDeep(CHART_DEFAULTS, {
           scales: {
             x: { type: 'linear', title: { display: true, text: 'Timestamp', color: '#475569' } },
@@ -680,39 +823,31 @@
       });
     }
 
-    // 3) Trade price histogram
+    // 3) Trade histogram ───────────────────────────────────────────────────
     function renderTradeHistChart() {
       destroyChart('tradeHist');
       if (!tradeData.length) return;
       const canvas = document.getElementById('tradeHistChart');
       canvas.style.display = 'block';
-
       const products = [...new Set(tradeData.map(r => r.symbol))].filter(Boolean);
 
-      // bin each product
       const datasets = products.map((p, i) => {
         const prices = tradeData.filter(r => r.symbol === p).map(r => parseFloat(r.price)).filter(v => !isNaN(v));
         if (!prices.length) return null;
         const min = Math.min(...prices), max = Math.max(...prices);
-        const bins = 20;
-        const step = (max - min) / bins || 1;
+        const bins = 20, step = (max - min) / bins || 1;
         const counts = new Array(bins).fill(0);
-        prices.forEach(pr => {
-          const idx = Math.min(Math.floor((pr - min) / step), bins - 1);
-          counts[idx]++;
-        });
+        prices.forEach(pr => { counts[Math.min(Math.floor((pr - min) / step), bins - 1)]++; });
         return {
           label: p,
           data: counts.map((c, idx) => ({ x: +(min + idx * step).toFixed(1), y: c })),
           backgroundColor: PALETTE[i % PALETTE.length] + '99',
-          borderColor: PALETTE[i % PALETTE.length],
-          borderWidth: 1,
+          borderColor: PALETTE[i % PALETTE.length], borderWidth: 1,
         };
       }).filter(Boolean);
 
       charts.tradeHist = new Chart(canvas, {
-        type: 'bar',
-        data: { datasets },
+        type: 'bar', data: { datasets },
         options: mergeDeep(CHART_DEFAULTS, {
           scales: {
             x: { type: 'linear', title: { display: true, text: 'Price', color: '#475569' }, offset: false },
@@ -722,20 +857,18 @@
       });
     }
 
-    // 4) Trade volume over time (bar per timestamp bucket)
+    // 4) Volume ───────────────────────────────────────────────────────────
     function renderVolumeChart() {
       destroyChart('volume');
       if (!tradeData.length) return;
       const canvas = document.getElementById('volumeChart');
       canvas.style.display = 'block';
-
       const products = [...new Set(tradeData.map(r => r.symbol))].filter(Boolean);
       const BUCKET = 1000;
 
       const datasets = products.map((p, i) => {
-        const rows = tradeData.filter(r => r.symbol === p);
         const buckets = {};
-        rows.forEach(r => {
+        tradeData.filter(r => r.symbol === p).forEach(r => {
           const ts = Math.floor((parseInt(r.timestamp) || 0) / BUCKET) * BUCKET;
           buckets[ts] = (buckets[ts] || 0) + (parseFloat(r.quantity) || 0);
         });
@@ -744,14 +877,12 @@
           label: p,
           data: sorted.map(k => ({ x: +k, y: buckets[k] })),
           backgroundColor: PALETTE[i % PALETTE.length] + 'aa',
-          borderColor: PALETTE[i % PALETTE.length],
-          borderWidth: 1,
+          borderColor: PALETTE[i % PALETTE.length], borderWidth: 1,
         };
       });
 
       charts.volume = new Chart(canvas, {
-        type: 'bar',
-        data: { datasets },
+        type: 'bar', data: { datasets },
         options: mergeDeep(CHART_DEFAULTS, {
           scales: {
             x: { type: 'linear', title: { display: true, text: 'Timestamp', color: '#475569' } },
@@ -761,12 +892,11 @@
       });
     }
 
-    // 5) PnL over time
+    // 5) PnL ──────────────────────────────────────────────────────────────
     function renderPnlChart() {
       destroyChart('pnl');
       const canvas = document.getElementById('pnlChart');
       canvas.style.display = 'block';
-
       const products = [...new Set(priceData.map(r => r.product))].filter(Boolean);
       const SAMPLE = 5;
 
@@ -778,16 +908,12 @@
           data: rows.map(r => ({ x: parseInt(r.timestamp) || 0, y: parseFloat(r.profit_and_loss) || 0 })),
           borderColor: PALETTE[i % PALETTE.length],
           backgroundColor: PALETTE[i % PALETTE.length] + '22',
-          fill: true,
-          borderWidth: 1.5,
-          pointRadius: 0,
-          tension: 0.3,
+          fill: true, borderWidth: 1.5, pointRadius: 0, tension: 0.3,
         };
       });
 
       charts.pnl = new Chart(canvas, {
-        type: 'line',
-        data: { datasets },
+        type: 'line', data: { datasets },
         options: mergeDeep(CHART_DEFAULTS, {
           scales: {
             x: { type: 'linear', title: { display: true, text: 'Timestamp', color: '#475569' } },
@@ -797,9 +923,7 @@
       });
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // Trades Table
-    // ────────────────────────────────────────────────────────────────────
+    // ── Trades Table ──────────────────────────────────────────────────────
     function renderTradeTable() {
       const container = document.getElementById('tradeTableContainer');
       const productFilter = document.getElementById('tableProductFilter').value;
@@ -807,7 +931,6 @@
 
       let rows = tradeData;
       if (productFilter !== 'ALL') rows = rows.filter(r => r.symbol === productFilter);
-
       document.getElementById('tradeBadge').textContent = rows.length.toLocaleString();
 
       if (!rows.length) {
@@ -821,17 +944,10 @@
 
       container.innerHTML = `
     <table>
-      <thead>
-        <tr>
-          <th>Timestamp</th>
-          <th>Symbol</th>
-          <th>Price</th>
-          <th>Qty</th>
-          <th>Buyer</th>
-          <th>Seller</th>
-          <th>Currency</th>
-        </tr>
-      </thead>
+      <thead><tr>
+        <th>Timestamp</th><th>Symbol</th><th>Price</th><th>Qty</th>
+        <th>Buyer</th><th>Seller</th><th>Currency</th>
+      </tr></thead>
       <tbody>
         ${display.map(r => {
         const price = parseFloat(r.price);
@@ -847,20 +963,16 @@
           </tr>`;
       }).join('')}
       </tbody>
-    </table>
-  `;
+    </table>`;
     }
 
-    // Product filter: re-render charts client-side (no re-fetch needed)
-    document.getElementById('productSelect').addEventListener('change', () => {
-      if (priceData.length) {
-        renderPriceChart();
-        renderTradeTable();
-      }
+    // ── Order book product change ─────────────────────────────────────────
+    document.getElementById('orderBookProduct').addEventListener('change', () => {
+      if (priceData.length) renderOrderBookChart();
     });
 
-    // Auto-load on page open (Tutorial Round 1, Day -1, All Products)
-    window.addEventListener('DOMContentLoaded', loadData);
+    // ── Boot ──────────────────────────────────────────────────────────────
+    window.addEventListener('DOMContentLoaded', () => onRoundChange());
   </script>
 </body>
 
