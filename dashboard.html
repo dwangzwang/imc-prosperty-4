@@ -1,0 +1,867 @@
+<!-- run python3 -m http.server 8765 to start the server-->
+<!-- go to http://localhost:8765/dashboard.html to see the dashboard -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IMC Prosperity — Trading Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0b0e1a;
+      --panel: #111827;
+      --border: #1e2d47;
+      --accent: #3b82f6;
+      --accent2: #10b981;
+      --accent3: #f59e0b;
+      --accent4: #ef4444;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --card: #151f30;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ── Header ─────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 32px;
+      background: linear-gradient(90deg, #0d1526 0%, #111827 100%);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo-icon {
+      width: 36px;
+      height: 36px;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+    }
+
+    .logo h1 {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+    }
+
+    .logo span {
+      color: var(--accent);
+    }
+
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    select,
+    button {
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-size: 13px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+    }
+
+    select:hover,
+    button:hover {
+      border-color: var(--accent);
+    }
+
+    button.primary {
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      border: none;
+      font-weight: 600;
+      letter-spacing: .3px;
+    }
+
+    button.primary:hover {
+      opacity: .9;
+    }
+
+    button.primary:disabled {
+      opacity: .4;
+      cursor: default;
+    }
+
+    /* ── Stat Cards ─────────────────────────── */
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 14px;
+      padding: 24px 32px 0;
+    }
+
+    .stat-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      transition: border-color .2s;
+    }
+
+    .stat-card:hover {
+      border-color: var(--accent);
+    }
+
+    .stat-label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      margin-bottom: 8px;
+    }
+
+    .stat-value {
+      font-size: 22px;
+      font-weight: 700;
+    }
+
+    .stat-sub {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+
+    .stat-pos {
+      color: var(--accent2);
+    }
+
+    .stat-neg {
+      color: var(--accent4);
+    }
+
+    /* ── Charts ─────────────────────────────── */
+    .charts-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      padding: 24px 32px;
+    }
+
+    .chart-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+    }
+
+    .chart-card.wide {
+      grid-column: 1 / -1;
+    }
+
+    .chart-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .badge {
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 99px;
+      font-weight: 500;
+      background: rgba(59, 130, 246, .2);
+      color: var(--accent);
+      border: 1px solid rgba(59, 130, 246, .3);
+    }
+
+    canvas {
+      display: block;
+    }
+
+    /* ── Trades Table ───────────────────────── */
+    .table-section {
+      padding: 0 32px 32px;
+    }
+
+    .table-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+    }
+
+    .table-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .table-header .chart-title {
+      margin: 0;
+    }
+
+    .filter-row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    thead th {
+      background: rgba(255, 255, 255, .03);
+      padding: 12px 20px;
+      text-align: left;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .7px;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+    }
+
+    tbody tr {
+      border-bottom: 1px solid rgba(255, 255, 255, .04);
+      transition: background .15s;
+    }
+
+    tbody tr:hover {
+      background: rgba(59, 130, 246, .06);
+    }
+
+    tbody td {
+      padding: 11px 20px;
+    }
+
+    .price-up {
+      color: var(--accent2);
+      font-weight: 600;
+    }
+
+    .price-dn {
+      color: var(--accent4);
+      font-weight: 600;
+    }
+
+    /* ── Loading / Empty ───────────────────── */
+    .loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 160px;
+      color: var(--muted);
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .spinner {
+      width: 32px;
+      height: 32px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    /* ── Responsive ─────────────────────────── */
+    @media (max-width: 768px) {
+      .charts-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .chart-card.wide {
+        grid-column: auto;
+      }
+
+      header {
+        flex-direction: column;
+        gap: 14px;
+      }
+
+      .stats-row,
+      .charts-grid,
+      .table-section {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <header>
+    <div class="logo">
+      <div class="logo-icon">📈</div>
+      <h1>IMC <span>Prosperity</span> — Dashboard</h1>
+    </div>
+    <div class="controls">
+      <select id="roundSelect" onchange="loadData()">
+        <option value="TUTORIAL_ROUND_1">Tutorial Round 1</option>
+      </select>
+      <select id="daySelect" onchange="loadData()"></select>
+      <select id="productSelect">
+        <option value="ALL">All Products</option>
+      </select>
+    </div>
+  </header>
+
+  <!-- Stat Cards -->
+  <div class="stats-row" id="statsRow">
+    <div class="stat-card">
+      <div class="stat-label">Products</div>
+      <div class="stat-value" id="statProducts">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Price Rows</div>
+      <div class="stat-value" id="statPriceRows">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total Trades</div>
+      <div class="stat-value" id="statTrades">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Avg Mid Price</div>
+      <div class="stat-value" id="statAvgMid">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Spread (avg)</div>
+      <div class="stat-value" id="statSpread">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Trade Volume</div>
+      <div class="stat-value" id="statVolume">—</div>
+    </div>
+  </div>
+
+  <!-- Charts -->
+  <div class="charts-grid">
+    <div class="chart-card wide">
+      <div class="chart-title">📉 Mid Price Over Time <span class="badge" id="priceChartBadge">—</span></div>
+      <canvas id="priceChart" height="100"></canvas>
+      <div class="loading" id="priceLoading">
+        <div class="spinner"></div><span>Load data to begin</span>
+      </div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">📊 Bid / Ask Spread Over Time</div>
+      <canvas id="spreadChart" height="140"></canvas>
+      <div class="loading" id="spreadLoading">
+        <div class="spinner" style="display:none"></div><span>Load data to begin</span>
+      </div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">💹 Trade Price Distribution</div>
+      <canvas id="tradeHistChart" height="140"></canvas>
+      <div class="loading" id="tradeHistLoading">
+        <div class="spinner" style="display:none"></div><span>Load data to begin</span>
+      </div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">📦 Trade Volume Over Time</div>
+      <canvas id="volumeChart" height="140"></canvas>
+      <div class="loading" id="volumeLoading">
+        <div class="spinner" style="display:none"></div><span>Load data to begin</span>
+      </div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">🏷️ PnL Over Time</div>
+      <canvas id="pnlChart" height="140"></canvas>
+      <div class="loading" id="pnlLoading">
+        <div class="spinner" style="display:none"></div><span>Load data to begin</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Trades Table -->
+  <div class="table-section">
+    <div class="table-card">
+      <div class="table-header">
+        <div class="chart-title">🔄 Recent Trades <span class="badge" id="tradeBadge">0</span></div>
+        <div class="filter-row">
+          <select id="tableProductFilter" onchange="renderTradeTable()">
+            <option value="ALL">All Products</option>
+          </select>
+          <select id="tablePageSize" onchange="renderTradeTable()">
+            <option value="20">20 rows</option>
+            <option value="50">50 rows</option>
+            <option value="100">100 rows</option>
+          </select>
+        </div>
+      </div>
+      <div id="tradeTableContainer">
+        <div class="loading"><span style="color:var(--muted)">Load data to see trades</span></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ────────────────────────────────────────────────────────────────────
+    // State
+    // ────────────────────────────────────────────────────────────────────
+    let priceData = [];     // parsed rows from prices CSV
+    let tradeData = [];     // parsed rows from trades CSV
+    let charts = {};        // Chart.js instances
+
+    const PALETTE = [
+      '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'
+    ];
+
+    // ────────────────────────────────────────────────────────────────────
+    // Day selector — built from known file names
+    // ────────────────────────────────────────────────────────────────────
+    const DAYS = ['-1', '-2'];
+    const daySelect = document.getElementById('daySelect');
+    DAYS.forEach(d => {
+      const o = document.createElement('option');
+      o.value = d; o.textContent = `Day ${d}`;
+      daySelect.appendChild(o);
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // CSV parser (semicolon or comma)
+    // ────────────────────────────────────────────────────────────────────
+    function parseCSV(text) {
+      const lines = text.trim().split('\n');
+      const sep = lines[0].includes(';') ? ';' : ',';
+      const headers = lines[0].split(sep).map(h => h.trim());
+      return lines.slice(1).map(line => {
+        const vals = line.split(sep);
+        const row = {};
+        headers.forEach((h, i) => { row[h] = vals[i] !== undefined ? vals[i].trim() : ''; });
+        return row;
+      });
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Load both CSVs from the server
+    // ────────────────────────────────────────────────────────────────────
+    async function loadData() {
+      const round = document.getElementById('roundSelect').value;
+      const day = document.getElementById('daySelect').value;
+
+      showLoadingSpinners(true);
+
+      try {
+        const base = `data/${round}`;
+        const suffix = `round_0_day_${day}.csv`;
+
+        const [priceText, tradeText] = await Promise.all([
+          fetch(`${base}/prices_${suffix}`).then(r => { if (!r.ok) throw new Error('prices not found'); return r.text(); }),
+          fetch(`${base}/trades_${suffix}`).then(r => { if (!r.ok) throw new Error('trades not found'); return r.text(); }),
+        ]);
+
+        priceData = parseCSV(priceText);
+        tradeData = parseCSV(tradeText);
+
+        populateProductFilter();
+        updateStats();
+        renderAllCharts();
+        renderTradeTable();
+      } catch (e) {
+        alert('Error loading data: ' + e.message + '\n\nMake sure you are serving this file from the project root (e.g. python -m http.server 8765)');
+      }
+    }
+
+    function showLoadingSpinners(show) {
+      ['priceLoading', 'spreadLoading', 'tradeHistLoading', 'volumeLoading', 'pnlLoading'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+          el.style.display = show ? 'flex' : 'none';
+          const sp = el.querySelector('.spinner');
+          if (sp) sp.style.display = show ? 'block' : 'none';
+        }
+      });
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Populate product filters
+    // ────────────────────────────────────────────────────────────────────
+    function populateProductFilter() {
+      const products = [...new Set(priceData.map(r => r.product))].filter(Boolean);
+
+      [document.getElementById('productSelect'), document.getElementById('tableProductFilter')].forEach(sel => {
+        sel.innerHTML = '<option value="ALL">All Products</option>';
+        products.forEach(p => {
+          const o = document.createElement('option');
+          o.value = p; o.textContent = p;
+          sel.appendChild(o);
+        });
+      });
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Stats
+    // ────────────────────────────────────────────────────────────────────
+    function updateStats() {
+      const products = [...new Set(priceData.map(r => r.product))].filter(Boolean);
+      document.getElementById('statProducts').textContent = products.length;
+      document.getElementById('statPriceRows').textContent = priceData.length.toLocaleString();
+      document.getElementById('statTrades').textContent = tradeData.length.toLocaleString();
+
+      const mids = priceData.map(r => parseFloat(r.mid_price)).filter(v => !isNaN(v));
+      const avg = mids.length ? (mids.reduce((a, b) => a + b, 0) / mids.length).toFixed(1) : '—';
+      document.getElementById('statAvgMid').textContent = avg;
+
+      const spreads = priceData.map(r => {
+        const a = parseFloat(r.ask_price_1), b = parseFloat(r.bid_price_1);
+        return (!isNaN(a) && !isNaN(b)) ? a - b : NaN;
+      }).filter(v => !isNaN(v));
+      const avgSpread = spreads.length ? (spreads.reduce((a, b) => a + b, 0) / spreads.length).toFixed(1) : '—';
+      document.getElementById('statSpread').textContent = avgSpread;
+
+      const vol = tradeData.reduce((s, r) => s + (parseFloat(r.quantity) || 0), 0);
+      document.getElementById('statVolume').textContent = vol.toLocaleString();
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Chart helpers
+    // ────────────────────────────────────────────────────────────────────
+    function destroyChart(id) {
+      if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+    }
+
+    const CHART_DEFAULTS = {
+      responsive: true,
+      animation: { duration: 600, easing: 'easeInOutQuart' },
+      plugins: {
+        legend: { labels: { color: '#94a3b8', font: { family: 'Inter', size: 11 }, boxWidth: 12 } },
+        tooltip: {
+          backgroundColor: '#1e293b',
+          borderColor: '#334155',
+          borderWidth: 1,
+          titleColor: '#e2e8f0',
+          bodyColor: '#94a3b8',
+          padding: 10,
+        }
+      },
+      scales: {
+        x: { ticks: { color: '#475569', font: { size: 10 }, maxTicksLimit: 10 }, grid: { color: 'rgba(255,255,255,.05)' } },
+        y: { ticks: { color: '#475569', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,.05)' } },
+      }
+    };
+
+    function mergeDeep(target, source) {
+      const out = Object.assign({}, target);
+      for (const k in source) {
+        if (source[k] && typeof source[k] === 'object' && !Array.isArray(source[k])) {
+          out[k] = mergeDeep(target[k] || {}, source[k]);
+        } else { out[k] = source[k]; }
+      }
+      return out;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Render ALL charts
+    // ────────────────────────────────────────────────────────────────────
+    function renderAllCharts() {
+      showLoadingSpinners(false);
+      renderPriceChart();
+      renderSpreadChart();
+      renderTradeHistChart();
+      renderVolumeChart();
+      renderPnlChart();
+    }
+
+    // 1) Mid Price Over Time (one line per product)
+    function renderPriceChart() {
+      destroyChart('price');
+      const canvas = document.getElementById('priceChart');
+      canvas.style.display = 'block';
+
+      const products = [...new Set(priceData.map(r => r.product))].filter(Boolean);
+      const selectedProduct = document.getElementById('productSelect').value;
+      const prods = selectedProduct === 'ALL' ? products : [selectedProduct];
+
+      // Sample down for performance — pick every Nth row per product
+      const SAMPLE = 5;
+
+      const datasets = prods.map((p, i) => {
+        const rows = priceData.filter(r => r.product === p)
+          .filter((_, idx) => idx % SAMPLE === 0);
+        return {
+          label: p,
+          data: rows.map(r => ({ x: parseInt(r.timestamp) || 0, y: parseFloat(r.mid_price) })),
+          borderColor: PALETTE[i % PALETTE.length],
+          backgroundColor: 'transparent',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.3,
+        };
+      });
+
+      document.getElementById('priceChartBadge').textContent = `${prods.length} product(s)`;
+
+      charts.price = new Chart(canvas, {
+        type: 'line',
+        data: { datasets },
+        options: mergeDeep(CHART_DEFAULTS, {
+          scales: {
+            x: { type: 'linear', title: { display: true, text: 'Timestamp', color: '#475569' } },
+            y: { title: { display: true, text: 'Mid Price', color: '#475569' } }
+          }
+        })
+      });
+    }
+
+    // 2) Bid/Ask Spread Over Time
+    function renderSpreadChart() {
+      destroyChart('spread');
+      const canvas = document.getElementById('spreadChart');
+      canvas.style.display = 'block';
+
+      const products = [...new Set(priceData.map(r => r.product))].filter(Boolean);
+      const SAMPLE = 5;
+
+      const datasets = products.map((p, i) => {
+        const rows = priceData.filter(r => r.product === p)
+          .filter((_, idx) => idx % SAMPLE === 0);
+        return {
+          label: p,
+          data: rows.map(r => {
+            const a = parseFloat(r.ask_price_1), b = parseFloat(r.bid_price_1);
+            return { x: parseInt(r.timestamp) || 0, y: (!isNaN(a) && !isNaN(b)) ? +(a - b).toFixed(2) : null };
+          }),
+          borderColor: PALETTE[i % PALETTE.length],
+          backgroundColor: 'transparent',
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.2,
+        };
+      });
+
+      charts.spread = new Chart(canvas, {
+        type: 'line',
+        data: { datasets },
+        options: mergeDeep(CHART_DEFAULTS, {
+          scales: {
+            x: { type: 'linear', title: { display: true, text: 'Timestamp', color: '#475569' } },
+            y: { title: { display: true, text: 'Spread', color: '#475569' } }
+          }
+        })
+      });
+    }
+
+    // 3) Trade price histogram
+    function renderTradeHistChart() {
+      destroyChart('tradeHist');
+      if (!tradeData.length) return;
+      const canvas = document.getElementById('tradeHistChart');
+      canvas.style.display = 'block';
+
+      const products = [...new Set(tradeData.map(r => r.symbol))].filter(Boolean);
+
+      // bin each product
+      const datasets = products.map((p, i) => {
+        const prices = tradeData.filter(r => r.symbol === p).map(r => parseFloat(r.price)).filter(v => !isNaN(v));
+        if (!prices.length) return null;
+        const min = Math.min(...prices), max = Math.max(...prices);
+        const bins = 20;
+        const step = (max - min) / bins || 1;
+        const counts = new Array(bins).fill(0);
+        prices.forEach(pr => {
+          const idx = Math.min(Math.floor((pr - min) / step), bins - 1);
+          counts[idx]++;
+        });
+        return {
+          label: p,
+          data: counts.map((c, idx) => ({ x: +(min + idx * step).toFixed(1), y: c })),
+          backgroundColor: PALETTE[i % PALETTE.length] + '99',
+          borderColor: PALETTE[i % PALETTE.length],
+          borderWidth: 1,
+        };
+      }).filter(Boolean);
+
+      charts.tradeHist = new Chart(canvas, {
+        type: 'bar',
+        data: { datasets },
+        options: mergeDeep(CHART_DEFAULTS, {
+          scales: {
+            x: { type: 'linear', title: { display: true, text: 'Price', color: '#475569' }, offset: false },
+            y: { title: { display: true, text: 'Count', color: '#475569' } }
+          }
+        })
+      });
+    }
+
+    // 4) Trade volume over time (bar per timestamp bucket)
+    function renderVolumeChart() {
+      destroyChart('volume');
+      if (!tradeData.length) return;
+      const canvas = document.getElementById('volumeChart');
+      canvas.style.display = 'block';
+
+      const products = [...new Set(tradeData.map(r => r.symbol))].filter(Boolean);
+      const BUCKET = 1000;
+
+      const datasets = products.map((p, i) => {
+        const rows = tradeData.filter(r => r.symbol === p);
+        const buckets = {};
+        rows.forEach(r => {
+          const ts = Math.floor((parseInt(r.timestamp) || 0) / BUCKET) * BUCKET;
+          buckets[ts] = (buckets[ts] || 0) + (parseFloat(r.quantity) || 0);
+        });
+        const sorted = Object.keys(buckets).sort((a, b) => +a - +b);
+        return {
+          label: p,
+          data: sorted.map(k => ({ x: +k, y: buckets[k] })),
+          backgroundColor: PALETTE[i % PALETTE.length] + 'aa',
+          borderColor: PALETTE[i % PALETTE.length],
+          borderWidth: 1,
+        };
+      });
+
+      charts.volume = new Chart(canvas, {
+        type: 'bar',
+        data: { datasets },
+        options: mergeDeep(CHART_DEFAULTS, {
+          scales: {
+            x: { type: 'linear', title: { display: true, text: 'Timestamp', color: '#475569' } },
+            y: { title: { display: true, text: 'Volume', color: '#475569' } }
+          }
+        })
+      });
+    }
+
+    // 5) PnL over time
+    function renderPnlChart() {
+      destroyChart('pnl');
+      const canvas = document.getElementById('pnlChart');
+      canvas.style.display = 'block';
+
+      const products = [...new Set(priceData.map(r => r.product))].filter(Boolean);
+      const SAMPLE = 5;
+
+      const datasets = products.map((p, i) => {
+        const rows = priceData.filter(r => r.product === p && r.profit_and_loss !== undefined)
+          .filter((_, idx) => idx % SAMPLE === 0);
+        return {
+          label: p,
+          data: rows.map(r => ({ x: parseInt(r.timestamp) || 0, y: parseFloat(r.profit_and_loss) || 0 })),
+          borderColor: PALETTE[i % PALETTE.length],
+          backgroundColor: PALETTE[i % PALETTE.length] + '22',
+          fill: true,
+          borderWidth: 1.5,
+          pointRadius: 0,
+          tension: 0.3,
+        };
+      });
+
+      charts.pnl = new Chart(canvas, {
+        type: 'line',
+        data: { datasets },
+        options: mergeDeep(CHART_DEFAULTS, {
+          scales: {
+            x: { type: 'linear', title: { display: true, text: 'Timestamp', color: '#475569' } },
+            y: { title: { display: true, text: 'PnL', color: '#475569' } }
+          }
+        })
+      });
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Trades Table
+    // ────────────────────────────────────────────────────────────────────
+    function renderTradeTable() {
+      const container = document.getElementById('tradeTableContainer');
+      const productFilter = document.getElementById('tableProductFilter').value;
+      const pageSize = parseInt(document.getElementById('tablePageSize').value);
+
+      let rows = tradeData;
+      if (productFilter !== 'ALL') rows = rows.filter(r => r.symbol === productFilter);
+
+      document.getElementById('tradeBadge').textContent = rows.length.toLocaleString();
+
+      if (!rows.length) {
+        container.innerHTML = '<div class="loading"><span style="color:var(--muted)">No trades found</span></div>';
+        return;
+      }
+
+      const display = rows.slice(0, pageSize);
+      const prices = rows.map(r => parseFloat(r.price)).filter(v => !isNaN(v));
+      const midPrice = prices.length ? prices.reduce((a, b) => a + b, 0) / prices.length : 0;
+
+      container.innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>Timestamp</th>
+          <th>Symbol</th>
+          <th>Price</th>
+          <th>Qty</th>
+          <th>Buyer</th>
+          <th>Seller</th>
+          <th>Currency</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${display.map(r => {
+        const price = parseFloat(r.price);
+        const cls = price >= midPrice ? 'price-up' : 'price-dn';
+        return `<tr>
+            <td>${r.timestamp ?? '—'}</td>
+            <td><strong>${r.symbol ?? '—'}</strong></td>
+            <td class="${cls}">${isNaN(price) ? '—' : price.toFixed(1)}</td>
+            <td>${r.quantity ?? '—'}</td>
+            <td>${r.buyer || '<span style="color:var(--muted)">—</span>'}</td>
+            <td>${r.seller || '<span style="color:var(--muted)">—</span>'}</td>
+            <td>${r.currency ?? '—'}</td>
+          </tr>`;
+      }).join('')}
+      </tbody>
+    </table>
+  `;
+    }
+
+    // Product filter: re-render charts client-side (no re-fetch needed)
+    document.getElementById('productSelect').addEventListener('change', () => {
+      if (priceData.length) {
+        renderPriceChart();
+        renderTradeTable();
+      }
+    });
+
+    // Auto-load on page open (Tutorial Round 1, Day -1, All Products)
+    window.addEventListener('DOMContentLoaded', loadData);
+  </script>
+</body>
+
+</html>
