@@ -1,6 +1,5 @@
 from datamodel import OrderDepth, UserId, TradingState, Order
 from typing import List, Dict
-import string
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BASE CLASS
@@ -102,19 +101,33 @@ class IntarianPepperRootStrategy(Strategy):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class OsmiumStrategy(Strategy):
-    SKEW_THRESHOLD    = 40
-    PASSIVE_SPREAD    = 2
-    MAX_PASSIVE_QTY   = 20
-    NETFLOW_THRESHOLD = 5
+    # ── Tune these ──────────────────────────────────────────────────────────
+    MAX_PASSIVE_QTY   = 40     # How much liquidity to provide per tick. Higher = more profit potential, but more risk if swept.
+    SKEW_DIVISOR      = 15     # Shift our prices 1 tick for every 15 units of inventory.
+    VOLATILITY_THRESH = 20     # If recent trade volume > 20, widen spreads to protect from toxic flow.
+    PANIC_THRESHOLD   = 75     # Emergency dump if inventory reaches this level.
+    # ────────────────────────────────────────────────────────────────────────
 
-    def _weighted_mid_2x(self, depth: OrderDepth) -> int:
-        best_bid = max(depth.buy_orders.keys(), default=0)
-        best_ask = min(depth.sell_orders.keys(), default=0)
-        if best_bid == 0 or best_ask == 0: return 0
+    def _deep_weighted_mid_2x(self, depth: OrderDepth) -> int:
+        """Calculates mid-price weighted by the top 3 levels of volume to prevent 1-lot baiting."""
+        top_bids = sorted(depth.buy_orders.items(), reverse=True)[:3]
+        top_asks = sorted(depth.sell_orders.items())[:3]
         
-        v_bid = abs(depth.buy_orders[best_bid])
-        v_ask = abs(depth.sell_orders[best_ask])
-        return int((best_bid * v_ask + best_ask * v_bid) * 2 / (v_bid + v_ask))
+        if not top_bids or not top_asks: 
+            return 0
+            
+        total_bid_vol = sum(abs(v) for p, v in top_bids)
+        total_ask_vol = sum(abs(v) for p, v in top_asks)
+        
+        if total_bid_vol == 0 or total_ask_vol == 0:
+            return 0
+        
+        bid_weight = sum(p * abs(v) for p, v in top_bids)
+        ask_weight = sum(p * abs(v) for p, v in top_asks)
+        
+        # Deep Weighted Mid formula
+        w_mid_2x = ((bid_weight / total_bid_vol) * total_ask_vol + (ask_weight / total_ask_vol) * total_bid_vol) * 2 / (total_bid_vol + total_ask_vol)
+        return int(w_mid_2x)
 
     def get_orders(self, state: TradingState) -> List[Order]:
         depth = state.order_depths[self.product]
@@ -123,61 +136,70 @@ class OsmiumStrategy(Strategy):
         if not depth.buy_orders or not depth.sell_orders:
             return []
 
-        # Calculate Market Flow (Adverse Selection)
-        market_trades = state.market_trades.get(self.product, [])
-        net_flow = 0 
-        for t in market_trades:
-            # If buyer is empty string, a seller hit the bid (aggressive selling)
-            if t.buyer == "": net_flow -= t.quantity
-            else: net_flow += t.quantity
+        # 1. Pre-calculate sorted keys for efficiency
+        sorted_bids = sorted(depth.buy_orders.keys(), reverse=True)
+        sorted_asks = sorted(depth.sell_orders.keys())
+        best_bid = sorted_bids[0]
+        best_ask = sorted_asks[0]
 
-        mid_2x = self._weighted_mid_2x(depth)
+        # 2. Calculate Deep Mid
+        mid_2x = self._deep_weighted_mid_2x(depth)
         if mid_2x == 0: return []
 
-        buy_cap = self.position_limit - position
-        sell_cap = self.position_limit + position
+        # 3. Dynamic Inventory Skewing (The "Lean")
+        # Example: If long (+30), we shift limits down by 2. This makes us sell cheaper and buy lower.
+        inventory_skew = position // self.SKEW_DIVISOR
+        
+        bid_limit = ((mid_2x - 1) // 2) - inventory_skew
+        ask_limit = (mid_2x // 2) + 1 - inventory_skew
 
-        bid_limit = (mid_2x - 1) // 2
-        ask_limit = (mid_2x // 2) + 1
-        flatten_price = (mid_2x + 1) // 2
-
-        # TOXIC FLOW PROTECTION: 
-        # If market is being slammed with sells, lower our bid to avoid catching the knife.
-        if net_flow < -self.NETFLOW_THRESHOLD:
+        # 4. Volatility Protection
+        # If market volume is high, the random walk is taking huge steps. Widen our spread.
+        market_trades = state.market_trades.get(self.product, [])
+        total_volume = sum(t.quantity for t in market_trades)
+        
+        if total_volume > self.VOLATILITY_THRESH:
             bid_limit -= 1
-        elif net_flow > self.NETFLOW_THRESHOLD:
             ask_limit += 1
 
         orders: List[Order] = []
+        buy_cap = self.position_limit - position
+        sell_cap = self.position_limit + position
 
-        # Step 1: Taking
-        for price, vol in sorted(depth.sell_orders.items()):
+        # 5. Step 1: Taking (Aggressive)
+        for price in sorted_asks:
             if price <= bid_limit and buy_cap > 0:
-                qty = min(buy_cap, abs(vol))
+                qty = min(buy_cap, abs(depth.sell_orders[price]))
                 orders.append(self.order(price, qty))
                 buy_cap -= qty
+                position += qty # Update local position state
 
-        for price, vol in sorted(depth.buy_orders.items(), reverse=True):
+        for price in sorted_bids:
             if price >= ask_limit and sell_cap > 0:
-                qty = min(sell_cap, vol)
+                qty = min(sell_cap, depth.buy_orders[price])
                 orders.append(self.order(price, -qty))
                 sell_cap -= qty
+                position -= qty
 
-        # Step 2: Passive (Competitive Pennying)
-        best_bid = max(depth.buy_orders.keys())
-        best_ask = min(depth.sell_orders.keys())
+        # 6. Step 2: Posting (Passive)
+        # Attempt to penny the market, but respect our calculated limits
         our_bid = min(bid_limit, best_bid + 1)
         our_ask = max(ask_limit, best_ask - 1)
 
-        if our_bid >= our_ask: our_bid = our_ask - 1
+        # Safety: Ensure a minimum 1-tick spread to prevent order rejection
+        if our_bid >= our_ask:
+            our_bid = our_ask - 1
 
         if buy_cap > 0:
             orders.append(self.order(our_bid, min(self.MAX_PASSIVE_QTY, buy_cap)))
         if sell_cap > 0:
             orders.append(self.order(our_ask, -min(self.MAX_PASSIVE_QTY, sell_cap)))
 
-        # Step 3: Flatten
-        if abs(position) > self.SKEW_THRESHOLD:
+        # 7. Step 3: Emergency Failsafe
+        # If the market trends violently and our skewing wasn't enough, dump before we hit the hard limit.
+        if abs(position) >= self.PANIC_THRESHOLD:
+            # Target the opposite best price to ensure an immediate fill
+            flatten_price = best_bid if position > 0 else best_ask
             orders.append(self.order(flatten_price, -position))
 
         return orders
