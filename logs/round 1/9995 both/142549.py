@@ -68,7 +68,7 @@ class IntarianPepperRootStrategy(Strategy):
 
         # 2. Opportunistic Selling (Special Market Making when edge is huge)
         opportunity_cost = self.EXPECTED_WAIT_TICKS / 1000
-        large_edge = self.PROFIT_MARGIN + self.BUY_EDGE + opportunity_cost
+        large_edge = self.PROFIT_MARGIN + opportunity_cost
 
         for bid in sorted(depth.buy_orders, reverse=True):
             if bid < fair_value + large_edge:
