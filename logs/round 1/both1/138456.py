@@ -86,21 +86,122 @@ class EmeraldsStrategy(Strategy):
 
         return orders
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTARIAN_PEPPER_ROOT (Rainforest Resin with linear growth)
+# True fair value = 12,000 + (timestamp / 1000).
+# ══════════════════════════════════════════════════════════════════════════════
+
+class IntarianPepperRootStrategy(Strategy):
+    # ── Tune these ──────────────────────────────────────────────────────────
+    SKEW_THRESHOLD  = 60     # flatten inventory when |position| exceeds this
+    PASSIVE_SPREAD  = 1      # fallback spread from fair value if book is thin
+    MAX_PASSIVE_QTY = 25     # max qty per passive resting quote
+    EXTRA_EDGE = 2
+    # ────────────────────────────────────────────────────────────────────────
+
+    def __init__(self):
+        super().__init__("INTARIAN_PEPPER_ROOT", position_limit=80)
+
+    def get_orders(self, depth: OrderDepth, position: int, timestamp: int) -> List[Order]:
+        # Linear growth: 1000 units per 1M timesteps
+        # starts at 12,000 on day 0
+        fair_value = 12_000 + (timestamp / 1000)
+
+        orders: List[Order] = []
+        buy_cap  =  self.position_limit - position
+        sell_cap =  self.position_limit + position
+
+        # Step 1: Take any resting orders that give positive edge
+        for ask in sorted(depth.sell_orders):
+            if ask >= fair_value - self.EXTRA_EDGE:
+                break
+            qty = min(-depth.sell_orders[ask], buy_cap)
+            if qty > 0:
+                print(f"[INTARIAN_PEPPER_ROOT] TAKE BUY  {qty}x @ {ask}")
+                orders.append(self.order(ask, qty))
+                buy_cap -= qty
+
+        for bid in sorted(depth.buy_orders, reverse=True):
+            if bid <= fair_value + self.EXTRA_EDGE:
+                break
+            qty = min(depth.buy_orders[bid], sell_cap)
+            if qty > 0:
+                print(f"[INTARIAN_PEPPER_ROOT] TAKE SELL {qty}x @ {bid}")
+                orders.append(self.order(bid, -qty))
+                sell_cap -= qty
+
+        # Step 2: Post passive quotes just inside the existing best bid/ask
+        best_bid = max(depth.buy_orders,  default=int(fair_value) - self.PASSIVE_SPREAD)
+        best_ask = min(depth.sell_orders, default=int(fair_value) + self.PASSIVE_SPREAD)
+
+        our_bid = min(best_bid + 1, int(fair_value) - 1)
+        our_ask = max(best_ask - 1, int(fair_value) + 1)
+
+        if (qty := min(self.MAX_PASSIVE_QTY, buy_cap)) > 0:
+            print(f"[INTARIAN_PEPPER_ROOT] PASSIVE BID {qty}x @ {our_bid}")
+            orders.append(self.order(our_bid, qty))
+
+        if (qty := min(self.MAX_PASSIVE_QTY, sell_cap)) > 0:
+            print(f"[INTARIAN_PEPPER_ROOT] PASSIVE ASK {qty}x @ {our_ask}")
+            orders.append(self.order(our_ask, -qty))
+
+        # Step 3: Flatten if inventory is too skewed
+        if abs(position) > self.SKEW_THRESHOLD:
+            flatten = -position
+            print(f"[INTARIAN_PEPPER_ROOT] FLATTEN {flatten}x @ {int(fair_value)} (was {position})")
+            orders.append(self.order(int(fair_value), flatten))
+
+        return orders
+
+class IntarianPepperRootStrategy2(Strategy):
+    # ── Tune these ──────────────────────────────────────────────────────────
+    BASE_VALUE = 12_000      # Starting value at timestamp 0
+    BUY_EDGE   = -8           # Increase this to only buy when "extra" cheap
+    # ────────────────────────────────────────────────────────────────────────
+
+    def __init__(self):
+        super().__init__("INTARIAN_PEPPER_ROOT", position_limit=80)
+
+    def get_orders(self, depth: OrderDepth, position: int, timestamp: int) -> List[Order]:
+        # Fair value growth: 1,000 units per 1,000,000 timesteps
+        fair_value = self.BASE_VALUE + (timestamp / 1000)
+        
+        orders: List[Order] = []
+        buy_cap = self.position_limit - position
+
+        # Sort asks from cheapest to most expensive
+        for ask in sorted(depth.sell_orders):
+            # SAFETY CHECK: Only buy if the price is below our projected fair value
+            if ask > (fair_value - self.BUY_EDGE):
+                break
+            
+            qty = min(-depth.sell_orders[ask], buy_cap)
+            if qty > 0:
+                print(f"[INTARIAN_PEPPER_ROOT] TAKE BUY {qty}x @ {ask} (Fair: {fair_value:.2f})")
+                orders.append(self.order(ask, qty))
+                buy_cap -= qty
+            
+            # Stop if we hit our position limit
+            if buy_cap <= 0:
+                break
+
+        return orders
+
 # ══════════════════════════════════════════════════════════════════════════════
 # INTARIAN_PEPPER_ROOT (Hybrid: Buy & Hold + Market Making)
 # Uses a "Hold Target" to stash assets and a "MM Zone" to scalp.
 # ══════════════════════════════════════════════════════════════════════════════
 
-class IntarianPepperRootStrategy(Strategy):
+class IntarianPepperRootStrategy3(Strategy):
     # ── Tune these ──────────────────────────────────────────────────────────
     BASE_VALUE      = 12_000 
+    HOLD_PORTION    = 65      # Amount to buy and hold long-term
     
-    # Accumulation
-    BUY_EDGE        = 7       # Will buy up to fair_value + 7 to hit MAX position (80)
-    
-    # Opportunistic Sell Parameters (for occasionally selling what we hold)
-    EXPECTED_WAIT_TICKS = 2_000  # Expected ticks before we can buy it back cheaper
-    PROFIT_MARGIN       = 2       # Minimum profit over opportunity cost to justify selling
+    # MM & Taking Parameters
+    EXTRA_EDGE      = 0       # Conservative edge for scalping (MM)
+    AGGRESSIVE_EDGE = -7      # Willing to pay 8 OVER fair to accumulate HOLD_PORTION
+    PASSIVE_SPREAD  = 1      
     
     # Liquidation
     END_TIMESTAMP    = 100_000 # Simulation ends at 100k
@@ -113,41 +214,56 @@ class IntarianPepperRootStrategy(Strategy):
         orders: List[Order] = []
         fair_value = self.BASE_VALUE + (timestamp / 1000)
         
+        # 1. Final Liquidation Logic
+        if timestamp >= self.END_TIMESTAMP:
+            if position > 0:
+                best_bid = max(depth.buy_orders, default=int(fair_value))
+                orders.append(self.order(best_bid, -position))
+            return orders
+
         buy_cap  = self.position_limit - position
         sell_cap = self.position_limit + position
 
-        # 1. Aggressive Accumulation (Buy & Hold to 80)
-        if position < self.position_limit:
+        # 2. Aggressive Accumulation (Buy & Hold)
+        # If we are below our HOLD_PORTION, buy anything up to (Fair + 8)
+        if position < self.HOLD_PORTION:
             for ask in sorted(depth.sell_orders):
-                if ask > fair_value + self.BUY_EDGE:
+                if ask > (fair_value - self.AGGRESSIVE_EDGE): # ask > fair + 8
                     break
-                qty = min(-depth.sell_orders[ask], self.position_limit - position)
+                qty = min(-depth.sell_orders[ask], self.HOLD_PORTION - position)
                 if qty > 0:
+                    print(f"[INTARIAN_PEPPER_ROOT] ACCUMULATING: {qty}x @ {ask}")
                     orders.append(self.order(ask, qty))
                     buy_cap -= qty
                     position += qty
 
-        # 2. Opportunistic Selling (Special Market Making when edge is huge)
-        opportunity_cost = self.EXPECTED_WAIT_TICKS / 1000
-        large_edge = self.PROFIT_MARGIN + opportunity_cost
+        # 3. Conservative Taking (Scalping)
+        # Use the EXTRA_EDGE (2) to take profitable orders for the MM portion
+        for ask in sorted(depth.sell_orders):
+            if ask >= fair_value - self.EXTRA_EDGE:
+                break
+            qty = min(-depth.sell_orders[ask], buy_cap)
+            if qty > 0:
+                orders.append(self.order(ask, qty))
+                buy_cap -= qty
+                position += qty
 
         for bid in sorted(depth.buy_orders, reverse=True):
-            if bid < fair_value + large_edge:
+            if bid <= fair_value + self.EXTRA_EDGE:
                 break
-                
             qty = min(depth.buy_orders[bid], sell_cap)
             if qty > 0:
                 orders.append(self.order(bid, -qty))
                 sell_cap -= qty
                 position -= qty
 
-        # 3. Passive Market Making
-        # Provide passive bids to continue accumulating, and passive asks at our minimum sell edge.
+        # 4. Passive Quotes (Market Making)
+        # Place quotes relative to fair value, biased by how far we are from HOLD_PORTION
         best_bid = max(depth.buy_orders, default=int(fair_value) - 1)
         best_ask = min(depth.sell_orders, default=int(fair_value) + 1)
         
         our_bid = min(best_bid + 1, int(fair_value) - 1)
-        our_ask = max(best_ask - 1, int(fair_value + large_edge))
+        our_ask = max(best_ask - 1, int(fair_value) + 1)
 
         if buy_cap > 0:
             orders.append(self.order(our_bid, min(buy_cap, 20)))
@@ -163,7 +279,7 @@ class IntarianPepperRootStrategy(Strategy):
 
 class KelpStrategy(Strategy):
     # ── Tune these ──────────────────────────────────────────────────────────
-    SKEW_THRESHOLD  = 60     # flatten inventory when |position| exceeds this
+    SKEW_THRESHOLD  = 40     # flatten inventory when |position| exceeds this
     PASSIVE_SPREAD  = 2      # fallback half-spread when book is empty
     MAX_PASSIVE_QTY = 20     # max qty per passive resting quote
     # ────────────────────────────────────────────────────────────────────────
@@ -247,8 +363,8 @@ class KelpStrategy(Strategy):
 STRATEGIES: Dict[str, Strategy] = {
     "EMERALDS": EmeraldsStrategy(),
     "TOMATOES": KelpStrategy("TOMATOES", position_limit=80),
-    "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy(),
-    # "ASH_COATED_OSMIUM": KelpStrategy("ASH_COATED_OSMIUM", position_limit=80)
+    "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy3(),
+    "ASH_COATED_OSMIUM": KelpStrategy("ASH_COATED_OSMIUM", position_limit=80)
 }
 
 
