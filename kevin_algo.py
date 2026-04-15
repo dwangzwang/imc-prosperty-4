@@ -107,9 +107,6 @@ class OsmiumStrategy(Strategy):
     MAX_PASSIVE_QTY   = 20
     NETFLOW_THRESHOLD = 5
 
-    def __init__(self):
-        super().__init__("ASH_COATED_OSMIUM", position_limit=80)
-
     def _weighted_mid_2x(self, depth: OrderDepth) -> int:
         best_bid = max(depth.buy_orders.keys(), default=0)
         best_ask = min(depth.sell_orders.keys(), default=0)
@@ -192,7 +189,7 @@ class OsmiumStrategy(Strategy):
 
 STRATEGIES: Dict[str, Strategy] = {
     "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy(),
-    "ASH_COATED_OSMIUM": OsmiumStrategy("ASH_COATED_OSMIUM", position_limit=80)
+    "ASH_COATED_OSMIUM": OsmiumStrategy("ASH_COATED_OSMIUM", position_limit = 80)
 }
 
 
