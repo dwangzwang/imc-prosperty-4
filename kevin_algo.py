@@ -14,77 +14,13 @@ class Strategy:
         self.product = product
         self.position_limit = position_limit
 
-    def get_orders(self, depth: OrderDepth, position: int, timestamp: int) -> List[Order]:
+    def get_orders(self, state: TradingState) -> List[Order]:
         """Override this in each product subclass."""
         raise NotImplementedError(f"{self.__class__.__name__} must implement get_orders()")
 
     def order(self, price: int, qty: int) -> Order:
         """Helper: positive qty = buy, negative qty = sell."""
         return Order(self.product, price, qty)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EMERALDS (Rainforest Resin)
-# True fair value = 10,000. Stable, so we take edge and post tight passives.
-# ══════════════════════════════════════════════════════════════════════════════
-
-class EmeraldsStrategy(Strategy):
-    # ── Tune these ──────────────────────────────────────────────────────────
-    FAIR_VALUE      = 10_000
-    SKEW_THRESHOLD  = 60     # flatten inventory when |position| exceeds this
-    PASSIVE_SPREAD  = 1      # fallback spread from fair value if book is thin
-    MAX_PASSIVE_QTY = 25     # max qty per passive resting quote
-    # ────────────────────────────────────────────────────────────────────────
-
-    def __init__(self):
-        super().__init__("EMERALDS", position_limit=80)
-
-    def get_orders(self, depth: OrderDepth, position: int, timestamp: int) -> List[Order]:
-        orders: List[Order] = []
-        buy_cap  =  self.position_limit - position
-        sell_cap =  self.position_limit + position
-
-        # Step 1: Take any resting orders that give positive edge
-        for ask in sorted(depth.sell_orders):
-            if ask >= self.FAIR_VALUE:
-                break
-            qty = min(-depth.sell_orders[ask], buy_cap)
-            if qty > 0:
-                print(f"[EMERALDS] TAKE BUY  {qty}x @ {ask}")
-                orders.append(self.order(ask, qty))
-                buy_cap -= qty
-
-        for bid in sorted(depth.buy_orders, reverse=True):
-            if bid <= self.FAIR_VALUE:
-                break
-            qty = min(depth.buy_orders[bid], sell_cap)
-            if qty > 0:
-                print(f"[EMERALDS] TAKE SELL {qty}x @ {bid}")
-                orders.append(self.order(bid, -qty))
-                sell_cap -= qty
-
-        # Step 2: Post passive quotes just inside the existing best bid/ask
-        best_bid = max(depth.buy_orders,  default=self.FAIR_VALUE - self.PASSIVE_SPREAD)
-        best_ask = min(depth.sell_orders, default=self.FAIR_VALUE + self.PASSIVE_SPREAD)
-
-        our_bid = min(best_bid + 1, self.FAIR_VALUE - 1)
-        our_ask = max(best_ask - 1, self.FAIR_VALUE + 1)
-
-        if (qty := min(self.MAX_PASSIVE_QTY, buy_cap)) > 0:
-            print(f"[EMERALDS] PASSIVE BID {qty}x @ {our_bid}")
-            orders.append(self.order(our_bid, qty))
-
-        if (qty := min(self.MAX_PASSIVE_QTY, sell_cap)) > 0:
-            print(f"[EMERALDS] PASSIVE ASK {qty}x @ {our_ask}")
-            orders.append(self.order(our_ask, -qty))
-
-        # Step 3: Flatten if inventory is too skewed
-        if abs(position) > self.SKEW_THRESHOLD:
-            flatten = -position
-            print(f"[EMERALDS] FLATTEN {flatten}x @ {self.FAIR_VALUE} (was {position})")
-            orders.append(self.order(self.FAIR_VALUE, flatten))
-
-        return orders
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INTARIAN_PEPPER_ROOT (Hybrid: Buy & Hold + Market Making)
@@ -109,7 +45,11 @@ class IntarianPepperRootStrategy(Strategy):
     def __init__(self):
         super().__init__("INTARIAN_PEPPER_ROOT", position_limit=80)
 
-    def get_orders(self, depth: OrderDepth, position: int, timestamp: int) -> List[Order]:
+    def get_orders(self, state: TradingState) -> List[Order]:
+        depth = state.order_depths[self.product]
+        position = state.position.get(self.product, 0)
+        timestamp = state.timestamp
+
         orders: List[Order] = []
         fair_value = self.BASE_VALUE + (timestamp / 1000)
         
@@ -157,15 +97,18 @@ class IntarianPepperRootStrategy(Strategy):
         return orders
         
 # ══════════════════════════════════════════════════════════════════════════════
-# KELP STRATEGY (applied to TOMATOES and ASH_COATED_OSMIUM)
+# OSMIUM STRATEGY (applied to TOMATOES and ASH_COATED_OSMIUM)
 # Fair value is unknown and drifts. We estimate it using WallMid.
 # ══════════════════════════════════════════════════════════════════════════════
 
-class KelpStrategy(Strategy):
+class OsmiumStrategy(Strategy):
     SKEW_THRESHOLD    = 40
     PASSIVE_SPREAD    = 2
     MAX_PASSIVE_QTY   = 20
     NETFLOW_THRESHOLD = 5
+
+    def __init__(self):
+        super().__init__("ASH_COATED_OSMIUM", position_limit=80)
 
     def _weighted_mid_2x(self, depth: OrderDepth) -> int:
         best_bid = max(depth.buy_orders.keys(), default=0)
@@ -176,7 +119,10 @@ class KelpStrategy(Strategy):
         v_ask = abs(depth.sell_orders[best_ask])
         return int((best_bid * v_ask + best_ask * v_bid) * 2 / (v_bid + v_ask))
 
-    def get_orders(self, depth: OrderDepth, position: int, timestamp: int, state: TradingState) -> List[Order]:
+    def get_orders(self, state: TradingState) -> List[Order]:
+        depth = state.order_depths[self.product]
+        position = state.position.get(self.product, 0)
+        
         if not depth.buy_orders or not depth.sell_orders:
             return []
 
@@ -245,10 +191,8 @@ class KelpStrategy(Strategy):
 # ══════════════════════════════════════════════════════════════════════════════
 
 STRATEGIES: Dict[str, Strategy] = {
-    "EMERALDS": EmeraldsStrategy(),
-    "TOMATOES": KelpStrategy("TOMATOES", position_limit=80),
     "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy(),
-    # "ASH_COATED_OSMIUM": KelpStrategy("ASH_COATED_OSMIUM", position_limit=80)
+    "ASH_COATED_OSMIUM": OsmiumStrategy("ASH_COATED_OSMIUM", position_limit=80)
 }
 
 
@@ -264,11 +208,7 @@ class Trader:
         for product, strategy in STRATEGIES.items():
             if product not in state.order_depths:
                 continue
-                
-            depth     = state.order_depths[product]
-            position  = state.position.get(product, 0)
-            timestamp = state.timestamp
             
-            result[product] = strategy.get_orders(depth, position, timestamp)
+            result[product] = strategy.get_orders(state)
 
         return result, 0, ""
