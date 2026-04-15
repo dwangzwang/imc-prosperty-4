@@ -162,80 +162,80 @@ class IntarianPepperRootStrategy(Strategy):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class KelpStrategy(Strategy):
-    # ── Tune these ──────────────────────────────────────────────────────────
-    SKEW_THRESHOLD  = 60     # flatten inventory when |position| exceeds this
-    PASSIVE_SPREAD  = 2      # fallback half-spread when book is empty
-    MAX_PASSIVE_QTY = 20     # max qty per passive resting quote
-    # ────────────────────────────────────────────────────────────────────────
+    SKEW_THRESHOLD    = 40
+    PASSIVE_SPREAD    = 2
+    MAX_PASSIVE_QTY   = 20
+    NETFLOW_THRESHOLD = 5
 
-    def __init__(self, product: str, position_limit: int):
-        super().__init__(product, position_limit)
+    def _weighted_mid_2x(self, depth: OrderDepth) -> int:
+        best_bid = max(depth.buy_orders.keys(), default=0)
+        best_ask = min(depth.sell_orders.keys(), default=0)
+        if best_bid == 0 or best_ask == 0: return 0
+        
+        v_bid = abs(depth.buy_orders[best_bid])
+        v_ask = abs(depth.sell_orders[best_ask])
+        return int((best_bid * v_ask + best_ask * v_bid) * 2 / (v_bid + v_ask))
 
-    def _wall_mid_2x(self, depth: OrderDepth) -> int:
-        """Return 2 * WallMid as an integer."""
-        best_bid = max(depth.buy_orders,  default=0)
-        best_ask = min(depth.sell_orders, default=0)
-        return best_bid + best_ask 
-
-    def get_orders(self, depth: OrderDepth, position: int, timestamp: int) -> List[Order]:
+    def get_orders(self, depth: OrderDepth, position: int, timestamp: int, state: TradingState) -> List[Order]:
         if not depth.buy_orders or not depth.sell_orders:
             return []
 
-        mid_2x  = self._wall_mid_2x(depth)
-        orders: List[Order] = []
-        buy_cap  = self.position_limit - position
+        # Calculate Market Flow (Adverse Selection)
+        market_trades = state.market_trades.get(self.product, [])
+        net_flow = 0 
+        for t in market_trades:
+            # If buyer is empty string, a seller hit the bid (aggressive selling)
+            if t.buyer == "": net_flow -= t.quantity
+            else: net_flow += t.quantity
+
+        mid_2x = self._weighted_mid_2x(depth)
+        if mid_2x == 0: return []
+
+        buy_cap = self.position_limit - position
         sell_cap = self.position_limit + position
 
-        bid_limit     = (mid_2x - 1) // 2
-        ask_limit     = mid_2x // 2 + 1
+        bid_limit = (mid_2x - 1) // 2
+        ask_limit = (mid_2x // 2) + 1
         flatten_price = (mid_2x + 1) // 2
 
-        # Step 1: Take any resting orders that give positive edge vs WallMid
-        for ask in sorted(depth.sell_orders):
-            if ask > bid_limit:
-                break
-            qty = min(-depth.sell_orders[ask], buy_cap)
-            if qty > 0:
-                print(f"[{self.product}] TAKE BUY  {qty}x @ {ask}")
-                orders.append(self.order(ask, qty))
+        # TOXIC FLOW PROTECTION: 
+        # If market is being slammed with sells, lower our bid to avoid catching the knife.
+        if net_flow < -self.NETFLOW_THRESHOLD:
+            bid_limit -= 1
+        elif net_flow > self.NETFLOW_THRESHOLD:
+            ask_limit += 1
+
+        orders: List[Order] = []
+
+        # Step 1: Taking
+        for price, vol in sorted(depth.sell_orders.items()):
+            if price <= bid_limit and buy_cap > 0:
+                qty = min(buy_cap, abs(vol))
+                orders.append(self.order(price, qty))
                 buy_cap -= qty
 
-        for bid in sorted(depth.buy_orders, reverse=True):
-            if bid < ask_limit:
-                break
-            qty = min(depth.buy_orders[bid], sell_cap)
-            if qty > 0:
-                print(f"[{self.product}] TAKE SELL {qty}x @ {bid}")
-                orders.append(self.order(bid, -qty))
+        for price, vol in sorted(depth.buy_orders.items(), reverse=True):
+            if price >= ask_limit and sell_cap > 0:
+                qty = min(sell_cap, vol)
+                orders.append(self.order(price, -qty))
                 sell_cap -= qty
 
-        # Step 2: Post passive quotes
-        best_bid = max(depth.buy_orders)
-        best_ask = min(depth.sell_orders)
+        # Step 2: Passive (Competitive Pennying)
+        best_bid = max(depth.buy_orders.keys())
+        best_ask = min(depth.sell_orders.keys())
+        our_bid = min(bid_limit, best_bid + 1)
+        our_ask = max(ask_limit, best_ask - 1)
 
-        fallback_bid = flatten_price - self.PASSIVE_SPREAD
-        fallback_ask = flatten_price + self.PASSIVE_SPREAD
+        if our_bid >= our_ask: our_bid = our_ask - 1
 
-        our_bid = min(best_bid + 1, bid_limit)
-        our_ask = max(best_ask - 1, ask_limit)
-
-        our_bid = max(our_bid, fallback_bid)
-        our_ask = min(our_ask, fallback_ask)
-
-        if our_bid < our_ask:
-            if (qty := min(self.MAX_PASSIVE_QTY, buy_cap)) > 0:
-                print(f"[{self.product}] PASSIVE BID {qty}x @ {our_bid}")
-                orders.append(self.order(our_bid, qty))
-
-            if (qty := min(self.MAX_PASSIVE_QTY, sell_cap)) > 0:
-                print(f"[{self.product}] PASSIVE ASK {qty}x @ {our_ask}")
-                orders.append(self.order(our_ask, -qty))
+        if buy_cap > 0:
+            orders.append(self.order(our_bid, min(self.MAX_PASSIVE_QTY, buy_cap)))
+        if sell_cap > 0:
+            orders.append(self.order(our_ask, -min(self.MAX_PASSIVE_QTY, sell_cap)))
 
         # Step 3: Flatten
         if abs(position) > self.SKEW_THRESHOLD:
-            flatten = -position
-            print(f"[{self.product}] FLATTEN {flatten}x @ {flatten_price} (was {position})")
-            orders.append(self.order(flatten_price, flatten))
+            orders.append(self.order(flatten_price, -position))
 
         return orders
 
