@@ -358,7 +358,7 @@
       <div class="stat-value" id="statSpread">—</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Trade Volume</div>
+      <div class="stat-label">Units Exchanged</div>
       <div class="stat-value" id="statVolume">—</div>
     </div>
   </div>
@@ -403,11 +403,20 @@
       </div>
     </div>
 
-    <!-- Volume -->
+    <!-- Quantity Exchanged -->
     <div class="chart-card">
-      <div class="chart-title">📦 Trade Volume Over Time</div>
+      <div class="chart-title">📦 Quantity of Units Exchanging Hands</div>
       <canvas id="volumeChart" height="160"></canvas>
       <div class="loading" id="volumeLoading">
+        <div class="spinner" style="display:none"></div><span>Load data to begin</span>
+      </div>
+    </div>
+
+    <!-- Trade Count Over Time -->
+    <div class="chart-card">
+      <div class="chart-title">🔢 Trades &amp; Offers Count Over Time <span class="badge" id="tradeCountBadge">per product</span></div>
+      <canvas id="tradeCountChart" height="160"></canvas>
+      <div class="loading" id="tradeCountLoading">
         <div class="spinner" style="display:none"></div><span>Load data to begin</span>
       </div>
     </div>
@@ -552,7 +561,7 @@
     }
 
     function showLoadingSpinners(show) {
-      ['orderBookLoading', 'priceLoading', 'spreadLoading', 'tradeHistLoading', 'volumeLoading', 'pnlLoading'].forEach(id => {
+      ['orderBookLoading', 'priceLoading', 'spreadLoading', 'tradeHistLoading', 'volumeLoading', 'pnlLoading', 'tradeCountLoading'].forEach(id => {
         const el = document.getElementById(id);
         if (!el) return;
         el.style.display = show ? 'flex' : 'none';
@@ -644,6 +653,7 @@
       renderTradeHistChart();
       renderVolumeChart();
       renderPnlChart();
+      renderTradeCountChart();
     }
 
     // 0) ORDER BOOK — main wide chart for one product ──────────────────────
@@ -886,7 +896,88 @@
         options: mergeDeep(CHART_DEFAULTS, {
           scales: {
             x: { type: 'linear', title: { display: true, text: 'Timestamp', color: '#475569' } },
-            y: { title: { display: true, text: 'Volume', color: '#475569' } }
+            y: { title: { display: true, text: 'Units Exchanged', color: '#475569' } }
+          }
+        })
+      });
+    }
+
+    // 5b) Trade Count Over Time ────────────────────────────────────────────
+    function renderTradeCountChart() {
+      destroyChart('tradeCount');
+      if (!tradeData.length) return;
+      const canvas = document.getElementById('tradeCountChart');
+      canvas.style.display = 'block';
+      const products = [...new Set(tradeData.map(r => r.symbol))].filter(Boolean);
+      const BUCKET = 1000;
+
+      // Build per-product count buckets
+      const allBuckets = new Set();
+      const productBuckets = {};
+      products.forEach(p => {
+        const buckets = {};
+        tradeData.filter(r => r.symbol === p).forEach(r => {
+          const ts = Math.floor((parseInt(r.timestamp) || 0) / BUCKET) * BUCKET;
+          buckets[ts] = (buckets[ts] || 0) + 1;
+          allBuckets.add(ts);
+        });
+        productBuckets[p] = buckets;
+      });
+
+      const sortedKeys = [...allBuckets].sort((a, b) => a - b);
+
+      const datasets = products.map((p, i) => ({
+        label: p,
+        data: sortedKeys.map(k => ({ x: k, y: productBuckets[p][k] || 0 })),
+        backgroundColor: PALETTE[i % PALETTE.length] + 'aa',
+        borderColor: PALETTE[i % PALETTE.length],
+        borderWidth: 1,
+        type: 'bar',
+      }));
+
+      // Overlay: total count across all products
+      const totalLine = {
+        label: 'Total',
+        data: sortedKeys.map(k => ({
+          x: k,
+          y: products.reduce((sum, p) => sum + (productBuckets[p][k] || 0), 0)
+        })),
+        borderColor: '#ffffff',
+        backgroundColor: 'transparent',
+        borderWidth: 2,
+        borderDash: [5, 3],
+        pointRadius: 0,
+        tension: 0.3,
+        type: 'line',
+        order: -1,
+      };
+      datasets.push(totalLine);
+
+      document.getElementById('tradeCountBadge').textContent = `${products.length} product(s)`;
+
+      charts.tradeCount = new Chart(canvas, {
+        type: 'bar',
+        data: { datasets },
+        options: mergeDeep(CHART_DEFAULTS, {
+          plugins: {
+            tooltip: {
+              callbacks: {
+                title: items => `Timestamp ${items[0].parsed.x}`,
+                label: item => ` ${item.dataset.label}: ${item.parsed.y} trade(s)`,
+              }
+            }
+          },
+          scales: {
+            x: {
+              type: 'linear',
+              stacked: true,
+              title: { display: true, text: 'Timestamp', color: '#475569' }
+            },
+            y: {
+              stacked: true,
+              title: { display: true, text: 'Trade Count', color: '#475569' },
+              ticks: { precision: 0, color: '#475569', font: { size: 10 } }
+            }
           }
         })
       });
