@@ -1,5 +1,6 @@
 from datamodel import OrderDepth, UserId, TradingState, Order
 from typing import List, Dict
+import math
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BASE CLASS
@@ -31,11 +32,11 @@ class IntarianPepperRootStrategy(Strategy):
     BASE_VALUE      = 12_000 
     
     # Accumulation
-    BUY_EDGE        = 7       # Will buy up to fair_value + 7 to hit MAX position (80)
+    INIT_OVERPAY        = 7       # Will buy up to fair_value + 7 to hit MAX position (80)
     
     # Opportunistic Sell Parameters (for occasionally selling what we hold)
-    EXPECTED_WAIT_TICKS = 2_000  # Expected ticks before we can buy it back cheaper
-    PROFIT_MARGIN       = 3       # Minimum profit over opportunity cost to justify selling
+    BUY_EDGE = 4 # how much we're willing to overpay to buy back
+    SELL_EDGE = 5 # how much edge we're willing to sell for
     
     # Liquidation
     END_TIMESTAMP    = 100_000 # Simulation ends at 100k
@@ -49,44 +50,61 @@ class IntarianPepperRootStrategy(Strategy):
         position = state.position.get(self.product, 0)
         timestamp = state.timestamp
 
+        # we can naively buy anything as long as it'll turn a profit by the end
+        # by doing so we forgo the chance to wait a short bit of time to buy a much cheaper one
+        # we balance these by taking the min of an initial overpay and the actual overpay limit?
+        overpay_amt = min(self.INIT_OVERPAY, math.ceil((100_000 - timestamp)/1_000))
+
         orders: List[Order] = []
-        fair_value = self.BASE_VALUE + (timestamp / 1000)
+        buy_fv = math.floor(self.BASE_VALUE + (timestamp / 1000))
+        sell_fv = math.ceil(self.BASE_VALUE + (timestamp / 1000))
         
         buy_cap  = self.position_limit - position
         sell_cap = self.position_limit + position
 
         # 1. Aggressive Accumulation (Buy & Hold to 80)
-        if position < self.position_limit:
+        # can buy up to 80 within first 1000 timesteps, so stop this after 1k, and make markets after
+        # overfitting to our data...?
+        if timestamp < 1000:    
             for ask in sorted(depth.sell_orders):
-                if ask > fair_value + self.BUY_EDGE:
+                if ask > buy_fv + overpay_amt:
                     break
                 qty = min(-depth.sell_orders[ask], self.position_limit - position)
                 if qty > 0:
                     orders.append(self.order(ask, qty))
                     buy_cap -= qty
-                    position += qty
 
-        # 2. Opportunistic Selling (Special Market Making when edge is huge)
-        opportunity_cost = self.EXPECTED_WAIT_TICKS / 1000
-        large_edge = self.PROFIT_MARGIN + self.BUY_EDGE + opportunity_cost
+        # 2. market making attempt
 
+        # place sells
         for bid in sorted(depth.buy_orders, reverse=True):
-            if bid < fair_value + large_edge:
+            # if people aren't offering high enough, skip
+            if bid < sell_fv + self.SELL_EDGE:
                 break
-                
+            
             qty = min(depth.buy_orders[bid], sell_cap)
             if qty > 0:
                 orders.append(self.order(bid, -qty))
                 sell_cap -= qty
-                position -= qty
 
+        # place buys
+        for ask in sorted(depth.sell_orders):
+            if ask > buy_fv + self.BUY_EDGE:
+                break
+
+            qty = min(-depth.sell_orders[ask], buy_cap)
+            if qty > 0:
+                orders.append(self.order(ask, qty))
+                buy_cap -= qty
+
+        # does this do anything?
         # 3. Passive Market Making
         # Provide passive bids to continue accumulating, and passive asks at our minimum sell edge.
-        best_bid = max(depth.buy_orders, default=int(fair_value) - 1)
-        best_ask = min(depth.sell_orders, default=int(fair_value) + 1)
+        best_bid = max(depth.buy_orders, default=int(buy_fv) - 1)
+        best_ask = min(depth.sell_orders, default=int(sell_fv) + 1)
         
-        our_bid = min(best_bid + 1, int(fair_value) - 1)
-        our_ask = max(best_ask - 1, int(fair_value + large_edge))
+        our_bid = min(best_bid + 1, buy_fv - 1)
+        our_ask = max(best_ask - 1, sell_fv + self.SELL_EDGE)
 
         if buy_cap > 0:
             orders.append(self.order(our_bid, min(buy_cap, 20)))
@@ -211,7 +229,7 @@ class OsmiumStrategy(Strategy):
 
 STRATEGIES: Dict[str, Strategy] = {
     "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy(),
-    "ASH_COATED_OSMIUM": OsmiumStrategy("ASH_COATED_OSMIUM", position_limit = 80)
+    # "ASH_COATED_OSMIUM": OsmiumStrategy("ASH_COATED_OSMIUM", position_limit = 80)
 }
 
 
