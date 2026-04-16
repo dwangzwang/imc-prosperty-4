@@ -35,11 +35,11 @@ class IntarianPepperRootStrategy(Strategy):
     INIT_OVERPAY        = 7       # Will buy up to fair_value + 7 to hit MAX position (80)
     
     # Opportunistic Sell Parameters (for occasionally selling what we hold)
-    # SELL_EDGE > BUY_EDGE MUST HOLD
-    # buy edge should be AT LEAST 4-5 to buy back fast enough
     BUY_EDGE = 4 # how much we're willing to overpay to buy back
-    # sell edge should be AT MOST 7 or else it never really happens
     SELL_EDGE = 5 # how much edge we're willing to sell for
+    
+    # Liquidation
+    END_TIMESTAMP    = 100_000 # Simulation ends at 100k
     # ────────────────────────────────────────────────────────────────────────
 
     def __init__(self):
@@ -229,7 +229,7 @@ class OsmiumStrategy(Strategy):
 
 STRATEGIES: Dict[str, Strategy] = {
     "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy(),
-    "ASH_COATED_OSMIUM": OsmiumStrategy("ASH_COATED_OSMIUM", position_limit = 80)
+    # "ASH_COATED_OSMIUM": OsmiumStrategy("ASH_COATED_OSMIUM", position_limit = 80)
 }
 
 
