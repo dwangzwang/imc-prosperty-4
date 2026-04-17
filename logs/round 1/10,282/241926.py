@@ -29,96 +29,87 @@ class Strategy:
 
 class IntarianPepperRootStrategy(Strategy):
     # ── Tune these ──────────────────────────────────────────────────────────
+    BASE_VALUE      = 12_000 
+    
     # Accumulation
-    INIT_OVERPAY        = 7       # Baseline willing overpay for accumulation limits
+    INIT_OVERPAY        = 7       # Will buy up to fair_value + 7 to hit MAX position (80)
     
     # Opportunistic Sell Parameters (for occasionally selling what we hold)
     # SELL_EDGE > BUY_EDGE MUST HOLD
     # buy edge should be AT LEAST 4-5 to buy back fast enough
-    BUY_EDGE = 5 # how much we're willing to overpay to buy back
+    BUY_EDGE = 4 # how much we're willing to overpay to buy back
     # sell edge should be AT MOST 7 or else it never really happens
-    SELL_EDGE = 6 # how much edge we're willing to sell for
+    SELL_EDGE = 5 # how much edge we're willing to sell for
     # ────────────────────────────────────────────────────────────────────────
 
     def __init__(self):
         super().__init__("INTARIAN_PEPPER_ROOT", position_limit=80)
-        self.base_value = None
-        self._init_mids = []
-        self._init_ticks = 5  # average over first 5 ticks
-
 
     def get_orders(self, state: TradingState) -> List[Order]:
         depth = state.order_depths[self.product]
         position = state.position.get(self.product, 0)
         timestamp = state.timestamp
 
-        if not depth.buy_orders or not depth.sell_orders:
-            return []
-
-        # Autocompute true starting day base value based on initial mid
-        if self.base_value is None:
-            mid = (max(depth.buy_orders) + min(depth.sell_orders)) / 2
-            self.base_value = mid - (timestamp / 1000)
-
-        # Baseline time decay (prevents negative crossover late in the day)
-        base_overpay = min(self.INIT_OVERPAY, max(0, math.ceil((100_000 - timestamp)/1_000)))
-        
-        # Acquisition Desperation: 
-        # If we are empty handed (position=0), we are overwhelmingly desperate and add +8 to our 
-        # overpay tolerance, creating a giant vacuum that sweeps asks. 
-        # As the bag fills to 80, this desperation seamlessly drops to 0.
-        time_remaining = max(0, (100_000 - timestamp) / 100_000)  # 1.0 → 0.0
-        desperation = int(8 * max(0, (self.position_limit - position) / self.position_limit) * time_remaining)
-        
-        overpay_amt = base_overpay + desperation
+        # we can naively buy anything as long as it'll turn a profit by the end
+        # by doing so we forgo the chance to wait a short bit of time to buy a much cheaper one
+        # we balance these by taking the min of an initial overpay and the actual overpay limit?
+        overpay_amt = min(self.INIT_OVERPAY, math.ceil((100_000 - timestamp)/1_000))
 
         orders: List[Order] = []
-        buy_fv = math.floor(self.base_value + (timestamp / 1000))
-        sell_fv = math.ceil(self.base_value + (timestamp / 1000))
+        buy_fv = math.floor(self.BASE_VALUE + (timestamp / 1000))
+        sell_fv = math.ceil(self.BASE_VALUE + (timestamp / 1000))
         
         buy_cap  = self.position_limit - position
         sell_cap = self.position_limit + position
 
-        # Consolidation: What is the highest price we are willing to TAKER buy right now?
-        max_aggressive_buy = int(buy_fv + max(overpay_amt, self.BUY_EDGE))
-        
-        # Consolidation: What is the lowest price we are willing to TAKER sell right now?
-        min_aggressive_sell = int(sell_fv + self.SELL_EDGE)
+        # 1. Aggressive Accumulation (Buy & Hold to 80)
+        # can buy up to 80 within first 1000 timesteps, so stop this after 1k, and make markets after
+        # overfitting to our data...?
+        if timestamp < 1000:    
+            for ask in sorted(depth.sell_orders):
+                if ask > buy_fv + overpay_amt:
+                    break
+                qty = min(-depth.sell_orders[ask], self.position_limit - position)
+                if qty > 0:
+                    orders.append(self.order(ask, qty))
+                    buy_cap -= qty
 
-        # 1. Consolidated Aggressive Taking
-        for ask in sorted(depth.sell_orders):
-            if ask > max_aggressive_buy:
-                break
-            qty = min(-depth.sell_orders[ask], buy_cap)
-            if qty > 0:
-                orders.append(self.order(ask, qty))
-                buy_cap -= qty
+        # 2. market making attempt
 
+        # place sells
         for bid in sorted(depth.buy_orders, reverse=True):
-            if bid < min_aggressive_sell:
+            # if people aren't offering high enough, skip
+            if bid < sell_fv + self.SELL_EDGE:
                 break
+            
             qty = min(depth.buy_orders[bid], sell_cap)
             if qty > 0:
                 orders.append(self.order(bid, -qty))
                 sell_cap -= qty
 
-        # 2. Passive Market Making
-        # By setting our passive bounds equal to our aggressive willingness, we stop 
-        # dropping out of the queue and ensure we accumulate as much as possible at Maker limits!
-        best_bid = max(depth.buy_orders.keys(), default=int(max_aggressive_buy) - 1)
-        best_ask = min(depth.sell_orders.keys(), default=int(min_aggressive_sell) + 1)
-        
-        our_bid = min(best_bid + 1, max_aggressive_buy)
-        our_ask = max(best_ask - 1, min_aggressive_sell)
-        
-        if our_bid >= our_ask:
-            our_bid = our_ask - 1
+        # place buys
+        for ask in sorted(depth.sell_orders):
+            if ask > buy_fv + self.BUY_EDGE:
+                break
 
-        # Use full capacity for Maker orders instead of bottlenecking at 20
+            qty = min(-depth.sell_orders[ask], buy_cap)
+            if qty > 0:
+                orders.append(self.order(ask, qty))
+                buy_cap -= qty
+
+        # does this do anything?
+        # 3. Passive Market Making
+        # Provide passive bids to continue accumulating, and passive asks at our minimum sell edge.
+        best_bid = max(depth.buy_orders, default=int(buy_fv) - 1)
+        best_ask = min(depth.sell_orders, default=int(sell_fv) + 1)
+        
+        our_bid = min(best_bid + 1, buy_fv - 1)
+        our_ask = max(best_ask - 1, sell_fv + self.SELL_EDGE)
+
         if buy_cap > 0:
-            orders.append(self.order(our_bid, buy_cap))
+            orders.append(self.order(our_bid, min(buy_cap, 20)))
         if sell_cap > 0:
-            orders.append(self.order(our_ask, -sell_cap))
+            orders.append(self.order(our_ask, -min(sell_cap, 20)))
 
         return orders
         
