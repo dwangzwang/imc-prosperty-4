@@ -1,7 +1,6 @@
 from datamodel import OrderDepth, UserId, TradingState, Order
 from typing import List, Dict
 import math
-import json
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BASE CLASS
@@ -29,65 +28,31 @@ class Strategy:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class IntarianPepperRootStrategy(Strategy):
-    INIT_OVERPAY    = 7
-    BUY_EDGE        = 5
-    SELL_EDGE       = 6
-    CRASH_THRESHOLD = 18
-    CRASH_RECOVER   =  8
+    INIT_OVERPAY = 7
+    BUY_EDGE     = 5
+    SELL_EDGE    = 6
 
     def __init__(self):
         super().__init__("INTARIAN_PEPPER_ROOT", position_limit=80)
         self.base_value = None
-        self.in_crash   = False
-        self.crash_fv   = None
 
     def get_orders(self, state: TradingState) -> List[Order]:
         depth     = state.order_depths[self.product]
         position  = state.position.get(self.product, 0)
         timestamp = state.timestamp
-        orders: List[Order] = []
 
         if not depth.buy_orders or not depth.sell_orders:
-            return orders
+            return []
 
-        mid      = (max(depth.buy_orders) + min(depth.sell_orders)) / 2
-        best_bid = max(depth.buy_orders)
-        best_ask = min(depth.sell_orders)
-
-        # ── Anchor fair value on first tick ──────────────────────────────────
+        # Anchor fair value on first tick's mid (linear drift is known-correct)
         if self.base_value is None:
-            self.base_value = mid - timestamp / 1000
+            self.base_value = (max(depth.buy_orders) + min(depth.sell_orders)) / 2 - (timestamp / 1000)
 
-        fv = self.base_value + timestamp / 1000
+        buy_fv  = math.floor(self.base_value + timestamp / 1000)
+        sell_fv = math.ceil(self.base_value  + timestamp / 1000)
 
-        # ── Crash detection and recovery ──────────────────────────────────────
-        if not self.in_crash and mid < fv - self.CRASH_THRESHOLD:
-            self.in_crash = True
-            self.crash_fv = fv                                  # freeze reference point
-
-        if self.in_crash:
-            if mid < fv:                                        # still falling — track floor
-                self.base_value = mid - timestamp / 1000
-                fv = mid
-            if mid >= self.crash_fv - self.CRASH_RECOVER:      # recovered vs frozen level
-                self.in_crash = False
-                self.crash_fv = None
-
-        # ── CRASH MODE: hit every bid to dump, no buying ──────────────────────
-        if self.in_crash:
-            sell_cap = self.position_limit + position
-            for bid in sorted(depth.buy_orders, reverse=True):
-                if sell_cap <= 0:
-                    break
-                qty = min(depth.buy_orders[bid], sell_cap)
-                orders.append(self.order(bid, -qty))
-                sell_cap -= qty
-            return orders
-
-        # ── NORMAL MODE ───────────────────────────────────────────────────────
-        buy_fv  = math.floor(fv)
-        sell_fv = math.ceil(fv)
-
+        # Overpay decays to 0 at end of day. Desperation adds urgency when empty,
+        # but is NOT throttled by time — being empty late is the worst case, not the best.
         base_overpay = min(self.INIT_OVERPAY, math.ceil((100_000 - timestamp) / 1_000))
         desperation  = int(8 * (self.position_limit - position) / self.position_limit)
         overpay_amt  = base_overpay + desperation
@@ -97,6 +62,7 @@ class IntarianPepperRootStrategy(Strategy):
 
         buy_cap  = self.position_limit - position
         sell_cap = self.position_limit + position
+        orders: List[Order] = []
 
         # 1. Aggressive taking
         for ask in sorted(depth.sell_orders):
@@ -113,7 +79,11 @@ class IntarianPepperRootStrategy(Strategy):
             orders.append(self.order(bid, -qty))
             sell_cap -= qty
 
-        # 2. Passive resting
+        # 2. Passive resting — bid at fair value or penny the book, whichever is lower.
+        # Never rest a passive bid above fair value (old algo's discipline).
+        best_bid = max(depth.buy_orders)
+        best_ask = min(depth.sell_orders)
+
         our_bid = min(best_bid + 1, buy_fv - 1)
         our_ask = max(best_ask - 1, min_sell)
 
@@ -377,7 +347,7 @@ STRATEGIES: Dict[str, Strategy] = {
 class Trader:
 
     def bid(self):
-        return 2_814
+        return 4_000
 
     def run(self, state: TradingState):
         result = {}
