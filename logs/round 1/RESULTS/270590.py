@@ -230,9 +230,6 @@ STRATEGIES: Dict[str, Strategy] = {
 
 class Trader:
 
-    def bid(self):
-        return 4_000
-
     def run(self, state: TradingState):
         result = {}
 

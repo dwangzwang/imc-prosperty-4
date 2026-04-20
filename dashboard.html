@@ -465,12 +465,12 @@
     // ── Known rounds + day ranges. Add new rounds/days here or rely on auto-probe ──
     // Structure: { roundKey: { label, days: [list of day strings to probe] } }
     const ROUND_CONFIG = {
-      TUTORIAL_ROUND_1: { label: 'Tutorial Round 0', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
-      ROUND1: { label: 'Round 1', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
-      ROUND2: { label: 'Round 2', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
-      ROUND3: { label: 'Round 3', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
-      ROUND4: { label: 'Round 4', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
-      ROUND5: { label: 'Round 5', days: ['-2', '-1', '0', '1', '2', '3', '4', '5'] },
+      TUTORIAL_ROUND_1: { label: 'Tutorial Round', fileRound: 0, days: ['-1', '0', '1'] },
+      ROUND1: { label: 'Round 1', fileRound: 1, days: ['-2', '-1', '0'] },
+      ROUND2: { label: 'Round 2', fileRound: 2, days: ['-1', '0', '1'] },
+      ROUND3: { label: 'Round 3', fileRound: 3, days: ['-1', '0', '1'] },
+      ROUND4: { label: 'Round 4', fileRound: 4, days: ['-1', '0', '1'] },
+      ROUND5: { label: 'Round 5', fileRound: 5, days: ['-1', '0', '1'] },
     };
 
     const PALETTE = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'];
@@ -492,7 +492,8 @@
       const candidates = ROUND_CONFIG[round]?.days ?? ['-2', '-1', '0', '1', '2', '3'];
       const available = [];
       await Promise.all(candidates.map(async d => {
-        const url = `data/${round}/prices_round_1_day_${d}.csv`;
+        const fileRound = ROUND_CONFIG[round].fileRound;
+        const url = `data/${round}/prices_round_${fileRound}_day_${d}.csv`;
         try {
           const r = await fetch(url, { method: 'HEAD' });
           if (r.ok) available.push(d);
@@ -538,7 +539,8 @@
 
       try {
         const base = `data/${round}`;
-        const suffix = `round_1_day_${day}.csv`;
+        const fileRound = ROUND_CONFIG[round].fileRound;
+        const suffix = `round_${fileRound}_day_${day}.csv`;
         const [priceText, tradeText] = await Promise.all([
           fetch(`${base}/prices_${suffix}`).then(r => { if (!r.ok) throw new Error('prices_' + suffix + ' not found'); return r.text(); }),
           fetch(`${base}/trades_${suffix}`).then(r => { if (!r.ok) throw new Error('trades_' + suffix + ' not found'); return r.text(); }),
