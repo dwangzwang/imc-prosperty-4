@@ -267,11 +267,18 @@ class HydrogelStrategy(Strategy):
         # (e.g. centered around 9980), the slow EMA gracefully drifts down to 9980,
         # preventing us from getting stuck continuously buying a "dip" that is actually the new normal.
         prices = saved.get("prices", [])
-        prices.append(wall_mid)
-        if len(prices) > self.ROLLING_WINDOW:
-            prices = prices[-self.ROLLING_WINDOW:]
+        ptr    = saved.get("ptr", 0)
+
+        if len(prices) < self.ROLLING_WINDOW:
+            prices.append(wall_mid)
+        else:
+            prices[ptr] = wall_mid
+
+        ptr = (ptr + 1) % self.ROLLING_WINDOW
         true_value = sum(prices) / len(prices)
+
         saved["prices"] = prices
+        saved["ptr"]    = ptr
 
         diff = fair - true_value
         if diff > self.ARB_THRESH:
@@ -330,7 +337,7 @@ class HydrogelStrategy(Strategy):
 class VelvetfruitStrategy(Strategy):
     WALL_VOL     = 10       # min size to count as a wall
     SMOOTH_A     = 0.15     # EMA alpha for fair value smoothing
-    ROLLING_WINDOW = 300_000  # max timesteps for pseudo-rolling mean
+    ROLLING_WINDOW = 150_000  # max timesteps for pseudo-rolling mean
     ARB_THRESH   = 3        # Tighter threshold given Velvetfruit's lower std dev (15 vs 32)
     SKEW_DIVISOR = 50       # Higher divisor = weaker skew, allows more volume buildup
     EDGE         = 1        # Min edge from skewed fair value
@@ -374,11 +381,18 @@ class VelvetfruitStrategy(Strategy):
         # Absorbs the slow linear drift of Velvetfruit. 
         # Initializes at the first tick's mid-price so it perfectly traces the day's baseline.
         prices = saved.get("prices", [])
-        prices.append(wall_mid)
-        if len(prices) > self.ROLLING_WINDOW:
-           prices = prices[-self.ROLLING_WINDOW:]
+        ptr    = saved.get("ptr", 0)
+
+        if len(prices) < self.ROLLING_WINDOW:
+           prices.append(wall_mid)
+        else:
+            prices[ptr] = wall_mid
+
+        ptr = (ptr + 1) % self.ROLLING_WINDOW
         true_value = sum(prices) / len(prices)
+
         saved["prices"] = prices
+        saved["ptr"]    = ptr
 
         diff = fair - true_value
         if diff > self.ARB_THRESH:
