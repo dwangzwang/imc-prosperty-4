@@ -1,0 +1,17 @@
+# Data files
+data/
+*.csv
+*.png
+*.pdf
+
+# Logs
+logs/
+*.json
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Local Backtester
+prosperity4bt_internal/
