@@ -327,6 +327,8 @@ class HydrogelStrategy(Strategy):
 class VelvetfruitStrategy(Strategy):
     WALL_VOL     = 10       # min size to count as a wall
     SMOOTH_A     = 0.15     # EMA alpha for fair value smoothing
+    SLOW_A       = 0.0005   # Alpha for dynamic true value anchor (absorbs the drift)
+    ARB_THRESH   = 3        # Tighter threshold given Velvetfruit's lower std dev (15 vs 32)
     SKEW_DIVISOR = 50       # Higher divisor = weaker skew, allows more volume buildup
     EDGE         = 1        # Min edge from skewed fair value
     MM_SIZE      = 20       # base quote size
@@ -364,6 +366,19 @@ class VelvetfruitStrategy(Strategy):
         fair = saved.get("fair", wall_mid)
         fair = self.SMOOTH_A * wall_mid + (1 - self.SMOOTH_A) * fair
         saved["fair"] = fair
+
+        # --- DYNAMIC TRUE VALUE ANCHOR (Robust Mean Reversion) ---
+        # Absorbs the slow linear drift of Velvetfruit. 
+        # Initializes at the first tick's mid-price so it perfectly traces the day's baseline.
+        true_value = saved.get("true_value", wall_mid)
+        true_value = self.SLOW_A * wall_mid + (1 - self.SLOW_A) * true_value
+        saved["true_value"] = true_value
+
+        diff = fair - true_value
+        if diff > self.ARB_THRESH:
+            fair -= (diff - self.ARB_THRESH)
+        elif diff < -self.ARB_THRESH:
+            fair -= (diff + self.ARB_THRESH)
 
         # --- INVENTORY SKEW ---
         # A strong linear skew actively shifts our pricing down as we get long, and up as we get short.
