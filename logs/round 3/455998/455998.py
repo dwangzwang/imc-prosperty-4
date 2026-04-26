@@ -215,13 +215,11 @@ class OsmiumStrategy(Strategy):
         return orders, {}
 
 class HydrogelStrategy(Strategy):
-    WALL_VOL     = 10       # min size to count as a wall
-    SMOOTH_A     = 0.15    # EMA alpha for fair value smoothing
-    SLOW_A       = 0.0005   # Alpha for dynamic true value anchor
-    ARB_THRESH   = 7       # Ticks away from true value before anchor kicks in
-    SKEW_DIVISOR = 50      # Higher divisor = weaker skew, allows more volume buildup
-    EDGE         = 1       # Min edge from skewed fair value
-    MM_SIZE      = 20      # base quote size
+    WALL_VOL  = 6       # min size to count as a wall
+    SMOOTH_A  = 0.25    # EMA alpha for fair value smoothing
+
+    MM_SIZE   = 10      # base quote size
+    EDGE      = 2       # min edge from fair value
 
     def __init__(self):
         super().__init__("HYDROGEL_PACK", position_limit=200)
@@ -266,29 +264,28 @@ class HydrogelStrategy(Strategy):
         # We initialize it at 10,000. If the actual simulation day is abnormally low 
         # (e.g. centered around 9980), the slow EMA gracefully drifts down to 9980,
         # preventing us from getting stuck continuously buying a "dip" that is actually the new normal.
+        SLOW_A = 0.001
         true_value = saved.get("true_value", 10000.0)
-        true_value = self.SLOW_A * wall_mid + (1 - self.SLOW_A) * true_value
+        true_value = SLOW_A * wall_mid + (1 - SLOW_A) * true_value
         saved["true_value"] = true_value
 
+        ARB_THRESH = 3
         diff = fair - true_value
-        if diff > self.ARB_THRESH:
-            fair -= (diff - self.ARB_THRESH)
-        elif diff < -self.ARB_THRESH:
-            fair -= (diff + self.ARB_THRESH)
+        if diff > ARB_THRESH:
+            fair -= (diff - ARB_THRESH)
+        elif diff < -ARB_THRESH:
+            fair -= (diff + ARB_THRESH)
 
         # --- INVENTORY SKEW ---
-        # We previously used a cubic skew which was too "flat" in the middle. 
-        # A strong linear skew actively shifts our pricing down as we get long, and up as we get short.
-        # We use a divisor of 40. At max position (200), skew is -5 ticks.
-        # This provides plenty of room to build up an inventory before we drastically panic our quotes.
-        skew = -(position / self.SKEW_DIVISOR)
+        inv_ratio = position / self.position_limit          # in [-1, 1]
+        skew = -(inv_ratio ** 3) * 15                       # nonlinear, bites hard near limits
 
         skewed_fair = fair + skew
         
-        # A static edge creates a tighter spread to ensure we are actually capturing trade volume.
-        # Combined with the linear skew, we remain perfectly safe while actively market making.
-        our_bid = math.floor(skewed_fair) - self.EDGE
-        our_ask = math.ceil(skewed_fair)  + self.EDGE
+        # A static edge of 2 creates a 4-tick wide spread. 
+        # This provides a buffer against volatility without being so wide that we never trade.
+        our_bid = math.floor(skewed_fair) - 2
+        our_ask = math.ceil(skewed_fair)  + 2
 
         # --- PURE MAKER LOGIC ---
         # Allow our quotes to improve the spread, but strictly cap them to not cross the existing market.
@@ -325,11 +322,9 @@ class HydrogelStrategy(Strategy):
 # and executing losing orders.
 
 class VelvetfruitStrategy(Strategy):
-    WALL_VOL     = 10       # min size to count as a wall
-    SMOOTH_A     = 0.15     # EMA alpha for fair value smoothing
-    SKEW_DIVISOR = 50       # Higher divisor = weaker skew, allows more volume buildup
-    EDGE         = 1        # Min edge from skewed fair value
-    MM_SIZE      = 20       # base quote size
+    WALL_VOL     = 15
+    SKEW_DIVISOR = 30       # moderate skew (less aggressive than Hydrogel)
+    MIN_EDGE     = 2        # start at 2 for more conservative quoting
 
     def __init__(self):
         super().__init__("VELVETFRUIT_EXTRACT", position_limit=200)
@@ -354,46 +349,67 @@ class VelvetfruitStrategy(Strategy):
         if not depth.buy_orders or not depth.sell_orders:
             return [], saved
 
-        best_bid = max(depth.buy_orders)
-        best_ask = min(depth.sell_orders)
+        # load persisted state (only vol tracker)
+        prev_mid = saved.get("prev_mid", None)
+        vol_ema  = saved.get("vol_ema", 0.0)
 
-        # --- WALL MID ---
-        wall_mid = self._get_wall_mid(depth)
+        # use raw wall-mid as fair value
+        fair = self._get_wall_mid(depth)
 
-        # --- SMOOTHED FAIR VALUE (EMA via traderdata) ---
-        fair = saved.get("fair", wall_mid)
-        fair = self.SMOOTH_A * wall_mid + (1 - self.SMOOTH_A) * fair
-        saved["fair"] = fair
-
-        # --- INVENTORY SKEW ---
-        # A strong linear skew actively shifts our pricing down as we get long, and up as we get short.
-        skew = -(position / self.SKEW_DIVISOR)
-
-        skewed_fair = fair + skew
+        # track volatility: EMA of |tick-to-tick changes|
+        jump = 0
+        if prev_mid is not None:
+            jump = abs(fair - prev_mid)
+            vol_ema = 0.1 * jump + 0.9 * vol_ema
         
-        # A static edge creates a tighter spread to ensure we are actually capturing trade volume.
-        our_bid = math.floor(skewed_fair) - self.EDGE
-        our_ask = math.ceil(skewed_fair)  + self.EDGE
+        # save updated state
+        saved = {"prev_mid": fair, "vol_ema": vol_ema}
 
-        # --- PURE MAKER LOGIC ---
-        our_bid = min(our_bid, best_ask - 1)
-        our_ask = max(our_ask, best_bid + 1)
-        
+        # inventory skew
+        skew = position / self.SKEW_DIVISOR
+        buy_fv = math.floor(fair - skew)
+        sell_fv = math.ceil(fair - skew)
+
+        # dynamic edge
+        edge = max(self.MIN_EDGE, math.ceil(vol_ema / 2))
+
+        buy_cap = self.position_limit - position
+        sell_cap = self.position_limit + position
+        orders: List[Order] = []
+
+        # taker
+        for ask in sorted(depth.sell_orders.keys()):
+            if ask <= buy_fv - edge and buy_cap > 0:
+                qty = min(buy_cap, abs(depth.sell_orders[ask]))
+                orders.append(self.order(ask, qty))
+                buy_cap -= qty
+
+        for bid in sorted(depth.buy_orders.keys(), reverse=True):
+            if bid >= sell_fv + edge and sell_cap > 0:
+                qty = min(sell_cap, depth.buy_orders[bid])
+                orders.append(self.order(bid, -qty))
+                sell_cap -= qty
+
+        # maker
+        best_bid = max(depth.buy_orders.keys())
+        best_ask = min(depth.sell_orders.keys())
+
+        our_bid = min(best_bid + 1, buy_fv - edge)
+        our_ask = max(best_ask - 1, sell_fv + edge)
+
         if our_bid >= our_ask:
             our_bid = our_ask - 1
 
-        # Shrink quote size as we approach the limit 
-        buy_cap  = self.position_limit - position   
-        sell_cap = self.position_limit + position   
+        passive_cap = max(10, self.position_limit - int(vol_ema * 10))
         
-        buy_size  = min(self.MM_SIZE, int(self.MM_SIZE * (buy_cap  / self.position_limit)))
-        sell_size = min(self.MM_SIZE, int(self.MM_SIZE * (sell_cap / self.position_limit)))
+        # fade quotes on huge instant price gaps
+        if jump > 8:
+            passive_cap = 0
 
-        orders: List[Order] = []
-        if buy_size > 0 and buy_cap > 0:
-            orders.append(self.order(our_bid, buy_size))
-        if sell_size > 0 and sell_cap > 0:
-            orders.append(self.order(our_ask, -sell_size))
+        if buy_cap > 0 and passive_cap > 0:
+            orders.append(self.order(our_bid, min(buy_cap, passive_cap)))
+        if sell_cap > 0 and passive_cap > 0:
+            orders.append(self.order(our_ask, -min(sell_cap, passive_cap)))
 
         return orders, saved
 
@@ -403,7 +419,7 @@ STRATEGIES: Dict[str, Strategy] = {
     # "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy("INTARIAN_PEPPER_ROOT", position_limit = 80),
     # "ASH_COATED_OSMIUM": OsmiumStrategy("ASH_COATED_OSMIUM", position_limit = 80),
     "HYDROGEL_PACK": HydrogelStrategy(),
-    "VELVETFRUIT_EXTRACT": VelvetfruitStrategy(),
+    # "VELVETFRUIT_EXTRACT": VelvetfruitStrategy(),
 }
 
 
