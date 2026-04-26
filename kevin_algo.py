@@ -373,8 +373,8 @@ class HydrogelStrategy(Strategy):
 class VelvetfruitStrategy(Strategy):
     WALL_VOL     = 10       # min size to count as a wall
     SMOOTH_A     = 0.15     # EMA alpha for fair value smoothing
-    ROLLING_WINDOW = 40_000
-    DOWNSAMPLE   = 4         # shorter window than Hydrogel — Velvetfruit drifts faster, so we track tighter (circular buffer — O(1) writes)
+    ROLLING_WINDOW = 80_000
+    DOWNSAMPLE   = 2         # shorter window than Hydrogel — Velvetfruit drifts faster, so we track tighter (circular buffer — O(1) writes)
     ARB_THRESH   = 3        # Tighter threshold given Velvetfruit's lower std dev (15 vs 32)
     SKEW_DIVISOR = 50       # Higher divisor = weaker skew, allows more volume buildup
     EDGE         = 1        # Min edge from skewed fair value
