@@ -217,7 +217,8 @@ class OsmiumStrategy(Strategy):
 class HydrogelStrategy(Strategy):
     WALL_VOL     = 10       # min size to count as a wall
     SMOOTH_A     = 0.15    # EMA alpha for fair value smoothing
-    ROLLING_WINDOW = 300_000  # max timesteps for pseudo-rolling mean
+    ROLLING_WINDOW = 45_000
+    DOWNSAMPLE   = 4         # max timesteps for pseudo-rolling mean (circular buffer — O(1) writes)
     ARB_THRESH   = 7       # Ticks away from true value before anchor kicks in
     SKEW_DIVISOR = 50      # Higher divisor = weaker skew, allows more volume buildup
     EDGE         = 1       # Min edge from skewed fair value
@@ -266,19 +267,21 @@ class HydrogelStrategy(Strategy):
         # We initialize it at 10,000. If the actual simulation day is abnormally low 
         # (e.g. centered around 9980), the slow EMA gracefully drifts down to 9980,
         # preventing us from getting stuck continuously buying a "dip" that is actually the new normal.
-        prices = saved.get("prices", [])
-        ptr    = saved.get("ptr", 0)
-
-        if len(prices) < self.ROLLING_WINDOW:
-            prices.append(wall_mid)
-        else:
-            prices[ptr] = wall_mid
-
-        ptr = (ptr + 1) % self.ROLLING_WINDOW
-        true_value = sum(prices) / len(prices)
-
-        saved["prices"] = prices
-        saved["ptr"]    = ptr
+        prices    = saved.get("prices", [])
+        ptr       = saved.get("ptr", 0)
+        tick_buf  = saved.get("tick_buf", [])
+        tick_buf.append(wall_mid)
+        if len(tick_buf) == self.DOWNSAMPLE:
+            if len(prices) < self.ROLLING_WINDOW:
+                prices.append(sum(tick_buf) / self.DOWNSAMPLE)
+            else:
+                prices[ptr] = sum(tick_buf) / self.DOWNSAMPLE
+            ptr = (ptr + 1) % self.ROLLING_WINDOW
+            tick_buf = []
+        true_value = sum(prices) / len(prices) if prices else wall_mid
+        saved["prices"]   = prices
+        saved["ptr"]      = ptr
+        saved["tick_buf"] = tick_buf
 
         diff = fair - true_value
         if diff > self.ARB_THRESH:
@@ -337,7 +340,8 @@ class HydrogelStrategy(Strategy):
 class VelvetfruitStrategy(Strategy):
     WALL_VOL     = 10       # min size to count as a wall
     SMOOTH_A     = 0.15     # EMA alpha for fair value smoothing
-    ROLLING_WINDOW = 150_000  # max timesteps for pseudo-rolling mean
+    ROLLING_WINDOW = 40_000
+    DOWNSAMPLE   = 4         # shorter window than Hydrogel — Velvetfruit drifts faster, so we track tighter (circular buffer — O(1) writes)
     ARB_THRESH   = 3        # Tighter threshold given Velvetfruit's lower std dev (15 vs 32)
     SKEW_DIVISOR = 50       # Higher divisor = weaker skew, allows more volume buildup
     EDGE         = 1        # Min edge from skewed fair value
@@ -380,19 +384,21 @@ class VelvetfruitStrategy(Strategy):
         # --- DYNAMIC TRUE VALUE ANCHOR (Robust Mean Reversion) ---
         # Absorbs the slow linear drift of Velvetfruit. 
         # Initializes at the first tick's mid-price so it perfectly traces the day's baseline.
-        prices = saved.get("prices", [])
-        ptr    = saved.get("ptr", 0)
-
-        if len(prices) < self.ROLLING_WINDOW:
-           prices.append(wall_mid)
-        else:
-            prices[ptr] = wall_mid
-
-        ptr = (ptr + 1) % self.ROLLING_WINDOW
-        true_value = sum(prices) / len(prices)
-
-        saved["prices"] = prices
-        saved["ptr"]    = ptr
+        prices    = saved.get("prices", [])
+        ptr       = saved.get("ptr", 0)
+        tick_buf  = saved.get("tick_buf", [])
+        tick_buf.append(wall_mid)
+        if len(tick_buf) == self.DOWNSAMPLE:
+            if len(prices) < self.ROLLING_WINDOW:
+                prices.append(sum(tick_buf) / self.DOWNSAMPLE)
+            else:
+                prices[ptr] = sum(tick_buf) / self.DOWNSAMPLE
+            ptr = (ptr + 1) % self.ROLLING_WINDOW
+            tick_buf = []
+        true_value = sum(prices) / len(prices) if prices else wall_mid
+        saved["prices"]   = prices
+        saved["ptr"]      = ptr
+        saved["tick_buf"] = tick_buf
 
         diff = fair - true_value
         if diff > self.ARB_THRESH:
