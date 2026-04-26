@@ -3,6 +3,39 @@ from typing import List, Dict, Tuple
 import math
 import json
 
+# BLACK-SCHOLES HELPERS
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+def bs_call(S: float, K: float, T: float, sigma: float) -> float:
+    if T <= 1e-8 or sigma <= 0:
+        return max(0.0, S - K)
+    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    return S * norm_cdf(d1) - K * norm_cdf(d2)
+
+def bs_vega(S: float, K: float, T: float, sigma: float) -> float:
+    if T <= 1e-8: return 0.0
+    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
+    return S * math.sqrt(T) * norm_pdf(d1)
+
+def implied_vol(market_price: float, S: float, K: float, T: float) -> float:
+    if T <= 1e-8: return None
+    intrinsic = max(0.0, S - K)
+    if market_price <= intrinsic + 0.01: return None
+    sigma = 0.04
+    for _ in range(50):
+        price = bs_call(S, K, T, sigma)
+        vega = bs_vega(S, K, T, sigma)
+        if vega < 1e-10: return None
+        sigma -= (price - market_price) / vega
+        if sigma <= 0.001: return None
+        if abs(price - market_price) < 0.001: return sigma
+    return None
+
 # BASE CLASS
 # all product strategies inherit from this
 # get_orders() receives a `saved` dict (loaded from traderData) and
@@ -439,12 +472,169 @@ class VelvetfruitStrategy(Strategy):
         return orders, saved
 
 
+class VEV_BS_Strategy(Strategy):
+    CURRENT_DAY  = 3            # Set this for Round 3 submission
+    TOTAL_LIFE   = 8            # Total option life
+    MIN_EDGE     = 1.5          # Minimum mispricing edge
+    SKEW_DIVISOR = 40           # Inventory skew divisor
+    EMA_ALPHA    = 0.1          # Sluggish tracking of IV to capture fast deviations
+
+    def __init__(self, strike: int):
+        super().__init__(f"VEV_{strike}", position_limit=300)
+        self.strike = strike
+
+    def _get_T(self, timestamp: int) -> float:
+        tte_days = (self.TOTAL_LIFE - self.CURRENT_DAY) - timestamp / 1_000_000
+        return max(1e-8, tte_days / self.TOTAL_LIFE)
+
+    def get_orders(self, state: TradingState, saved: dict) -> Tuple[List[Order], dict]:
+        vf_depth = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        if not vf_depth or not vf_depth.buy_orders or not vf_depth.sell_orders:
+            return [], saved
+        S = (max(vf_depth.buy_orders) + min(vf_depth.sell_orders)) / 2
+
+        depth = state.order_depths.get(self.product)
+        if not depth or not depth.buy_orders or not depth.sell_orders:
+            return [], saved
+
+        best_bid = max(depth.buy_orders.keys())
+        best_ask = min(depth.sell_orders.keys())
+        market_mid = (best_bid + best_ask) / 2
+        position = state.position.get(self.product, 0)
+        T = self._get_T(state.timestamp)
+
+        # 1. DYNAMIC IV ESTIMATION (The "Fitted Parabola" Tracking)
+        live_iv = implied_vol(market_mid, S, self.strike, T)
+        ema_iv = saved.get("ema_iv")
+        
+        if live_iv is not None:
+            if ema_iv is None:
+                ema_iv = live_iv
+            else:
+                ema_iv = self.EMA_ALPHA * live_iv + (1 - self.EMA_ALPHA) * ema_iv
+                
+        if ema_iv is None:
+            ema_iv = 0.04 # Fallback
+            
+        saved["ema_iv"] = ema_iv
+
+        # 2. SCALPING EDGE + INVENTORY SKEW
+        fair_base = bs_call(S, self.strike, T, ema_iv)
+        skew = -(position / self.SKEW_DIVISOR)
+        fair = fair_base + skew
+
+        buy_cap = self.position_limit - position
+        sell_cap = self.position_limit + position
+        orders: List[Order] = []
+
+        # Taker sweeps
+        for ask in sorted(depth.sell_orders.keys()):
+            if ask < fair - self.MIN_EDGE and buy_cap > 0:
+                qty = min(buy_cap, abs(depth.sell_orders[ask]))
+                orders.append(self.order(ask, qty))
+                buy_cap -= qty
+
+        for bid in sorted(depth.buy_orders.keys(), reverse=True):
+            if bid > fair + self.MIN_EDGE and sell_cap > 0:
+                qty = min(sell_cap, depth.buy_orders[bid])
+                orders.append(self.order(bid, -qty))
+                sell_cap -= qty
+
+        # Maker quotes
+        our_bid = min(best_bid + 1, math.floor(fair - self.MIN_EDGE))
+        our_ask = max(best_ask - 1, math.ceil(fair + self.MIN_EDGE))
+        if our_bid >= our_ask:
+            our_bid = our_ask - 1
+
+        if our_bid >= 1 and buy_cap > 0:
+            orders.append(self.order(our_bid, buy_cap))
+        if sell_cap > 0:
+            orders.append(self.order(our_ask, -sell_cap))
+
+        return orders, saved
+
+
+class VEV_VolArb_Strategy(Strategy):
+    SKEW_DIVISOR = 40           # Force the bot to buy back its shorts
+    STATIC_BIAS  = 1.5          # Tick bias to force shorting/buying structure
+    EDGE         = 1.0          # Spread edge
+
+    def __init__(self, strike: int):
+        super().__init__(f"VEV_{strike}", position_limit=300)
+        self.strike = strike
+
+    def get_orders(self, state: TradingState, saved: dict) -> Tuple[List[Order], dict]:
+        depth = state.order_depths.get(self.product)
+        if not depth or not depth.buy_orders or not depth.sell_orders:
+            return [], saved
+
+        position = state.position.get(self.product, 0)
+        buy_cap = self.position_limit - position
+        sell_cap = self.position_limit + position
+        
+        best_bid = max(depth.buy_orders.keys())
+        best_ask = min(depth.sell_orders.keys())
+        
+        # Base fair is the pure micro-price
+        fair = (best_bid + best_ask) / 2
+        
+        # Add Structural Bias
+        if self.strike >= 5300:
+            fair -= self.STATIC_BIAS # Force shorting structure
+        elif self.strike <= 5200:
+            fair += self.STATIC_BIAS # Force buying structure
+            
+        # Add Inventory Skew to enforce profit taking churn
+        skew = -(position / self.SKEW_DIVISOR)
+        skewed_fair = fair + skew
+        
+        our_bid = math.floor(skewed_fair) - self.EDGE
+        our_ask = math.ceil(skewed_fair) + self.EDGE
+        
+        our_bid = min(our_bid, best_ask - 1)
+        our_ask = max(our_ask, best_bid + 1)
+        if our_bid >= our_ask:
+            our_bid = our_ask - 1
+            
+        orders: List[Order] = []
+        if our_bid >= 1 and buy_cap > 0:
+            orders.append(self.order(our_bid, buy_cap))
+        if sell_cap > 0:
+            orders.append(self.order(our_ask, -sell_cap))
+
+        return orders, saved
+
+
 # registry to handle matching products to strategies
 STRATEGIES: Dict[str, Strategy] = {
     # "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy("INTARIAN_PEPPER_ROOT", position_limit = 80),
     # "ASH_COATED_OSMIUM": OsmiumStrategy("ASH_COATED_OSMIUM", position_limit = 80),
     "HYDROGEL_PACK": HydrogelStrategy(),
     "VELVETFRUIT_EXTRACT": VelvetfruitStrategy(),
+
+    # --- OPTIONS: VOLATILITY ARBITRAGE (SMIRK SNIPER) ---
+    # "VEV_4000": VEV_VolArb_Strategy(4000),
+    # "VEV_4500": VEV_VolArb_Strategy(4500),
+    # "VEV_5000": VEV_VolArb_Strategy(5000),
+    # "VEV_5100": VEV_VolArb_Strategy(5100),
+    # "VEV_5200": VEV_VolArb_Strategy(5200),
+    # "VEV_5300": VEV_VolArb_Strategy(5300),
+    # "VEV_5400": VEV_VolArb_Strategy(5400),
+    # "VEV_5500": VEV_VolArb_Strategy(5500),
+    # "VEV_6000": VEV_VolArb_Strategy(6000),
+    # "VEV_6500": VEV_VolArb_Strategy(6500),
+
+    # --- OPTIONS: BLACK-SCHOLES MAKER (DYNAMIC IV) ---
+    "VEV_4000": VEV_BS_Strategy(4000),
+    "VEV_4500": VEV_BS_Strategy(4500),
+    "VEV_5000": VEV_BS_Strategy(5000),
+    "VEV_5100": VEV_BS_Strategy(5100),
+    "VEV_5200": VEV_BS_Strategy(5200),
+    "VEV_5300": VEV_BS_Strategy(5300),
+    "VEV_5400": VEV_BS_Strategy(5400),
+    "VEV_5500": VEV_BS_Strategy(5500),
+    "VEV_6000": VEV_BS_Strategy(6000),
+    "VEV_6500": VEV_BS_Strategy(6500),
 }
 
 
