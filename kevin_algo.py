@@ -508,59 +508,172 @@ def implied_vol_newton(price: float, S: float, K: float, T: float,
     return sigma if 0.001 < sigma < 5.0 else None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VEV STRATEGY v6 — Zero Gates, Max Aggression, All Strikes
+# VEV OPTION STRATEGY v7 — Fixed BS with Delta-Aware Edge + IV Cross-Check
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# DIAGNOSIS: We were gating out all trades with min_spread filters and
-# conservative skew that rotated positions before spread could compound.
+# ROOT CAUSE FIXES vs original BS strategy:
 #
-# FIXES:
-#   - No liquidity gate. Post on every strike every tick regardless of spread.
-#   - Skew is soft (SKEW_DIV=80) — we HOLD inventory and let spread compound
-#     instead of rotating out immediately after every fill.
-#   - Taker edge dropped to 3 — fire more often on dislocations.
-#   - Full 300 position limit deployed on every strike including 4000.
-#   - EMA tracks faster (alpha=0.35) to catch intraday option price drift.
-#   - Quote improvement: always try best_bid+1 / best_ask-1 first.
-#     Only fall back to joining best if spread is exactly 1 tick.
-#   - Dump at ts >= 85000 to avoid overnight theta bleed.
+# 1. IV solver warm-start is now per-strike and sensible (not 0.04 for all).
+#    Deep ITM options (4000 when S~5200) have near-zero time value — we detect
+#    this and skip IV solving entirely, pricing at intrinsic + tiny premium.
+#
+# 2. TAKER_EDGE is now delta-adjusted. A deep ITM option has delta~1, meaning
+#    a 1-tick underlying move = 1-tick option move. Raw edge of 1.0 tick was
+#    just underlying noise. We scale required edge by (1 - delta) so deep ITM
+#    requires MORE edge (underlying noise is high) and ATM requires less.
+#
+# 3. IV is bounded per-strike by moneyness. Deep ITM IV > 0.8 is nonsense —
+#    we cap it tightly to prevent BS from outputting garbage fair values.
+#
+# 4. Maker quotes use FULL remaining capacity — no fractional sizing.
+#    Previous versions were posting tiny sizes that never moved the needle.
+#
+# 5. VELVETFRUIT underlying is read once and passed in — no stale S risk.
+
+# Reasonable IV ranges per moneyness bucket (log(K/S) roughly)
+# These prevent the solver from wandering into garbage territory
+IV_BOUNDS = {
+    # (moneyness_threshold, iv_floor, iv_cap)
+    # moneyness = log(K/S): negative = ITM, positive = OTM
+    "deep_itm":  (-0.20, 0.01, 0.25),   # K << S
+    "itm":       (-0.10, 0.05, 0.45),
+    "atm":       ( 0.05, 0.08, 0.60),   # near ATM
+    "otm":       ( 0.15, 0.05, 0.80),
+    "deep_otm":  ( 9.99, 0.02, 1.50),   # K >> S
+}
+
+def get_iv_bounds(S: float, K: float) -> Tuple[float, float]:
+    m = math.log(K / S)
+    if   m < -0.20: return 0.01, 0.25
+    elif m < -0.10: return 0.05, 0.45
+    elif m <  0.05: return 0.08, 0.60
+    elif m <  0.15: return 0.05, 0.80
+    else:           return 0.02, 1.50
+
+def bs_delta(S: float, K: float, T: float, sigma: float) -> float:
+    """Call delta — how much option moves per tick of underlying."""
+    if T <= 1e-8 or sigma <= 0:
+        return 1.0 if S > K else 0.0
+    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
+    return norm_cdf(d1)
+
+def safe_implied_vol(market_price: float, S: float, K: float, T: float) -> Optional[float]:
+    """
+    IV solver with per-strike warm start and bounded output.
+    Returns None if option is too deep ITM (intrinsic dominated) or solver fails.
+    """
+    if T <= 1e-8:
+        return None
+    intrinsic = max(0.0, S - K)
+    time_value = market_price - intrinsic
+    # If time value is less than 0.5 ticks, IV is unreliable — skip
+    if time_value < 0.5:
+        return None
+    iv_floor, iv_cap = get_iv_bounds(S, K)
+    # Warm start: rough approximation from Brenner-Subrahmanyam
+    sigma = max(iv_floor, min(iv_cap,
+        math.sqrt(2 * math.pi / T) * (time_value / S) if S > 0 else 0.20
+    ))
+    for _ in range(40):
+        price = bs_call(S, K, T, sigma)
+        vega  = bs_vega(S, K, T, sigma)
+        if vega < 1e-10:
+            break
+        step  = (price - market_price) / vega
+        sigma -= step
+        sigma  = max(iv_floor, min(iv_cap, sigma))
+        if abs(price - market_price) < 0.01:
+            return sigma
+    return sigma if iv_floor < sigma < iv_cap else None
+
 
 class VEV_Strategy(Strategy):
     TOTAL_LIFE  = 8
     CURRENT_DAY = 4        # ← UPDATE EACH ROUND
 
-    EMA_A       = 0.35     # Fast EMA — options drift hard intraday
-    SKEW_DIV    = 80       # Soft skew — hold inventory, let spread compound
-                           # At +300 position: only 3.75 tick shade
-    ARSON_EDGE  = 3        # Taker fires at 3-tick dislocation from EMA
+    # IV EMA: moderate speed — fast enough to track, slow enough to not chase
+    EMA_ALPHA   = 0.20
+
+    # Taker edge BASE — scaled up by delta so deep ITM requires more edge
+    # At delta=1.0 (deep ITM): required edge = BASE / (1 - delta + 0.15) = BASE/0.15 = large
+    # At delta=0.5 (ATM):      required edge = BASE / 0.65 = moderate
+    # At delta=0.1 (deep OTM): required edge = BASE / 1.0  = BASE
+    TAKER_BASE  = 1.5
+
+    # Maker edge: ticks inside fair value to post quotes
+    MAKER_EDGE  = 1.0
+
+    # Inventory skew: soft — we want fills, not frantic rotation
+    SKEW_DIV    = 50
+
+    # End of day flatten
     DUMP_TS     = 85_000
+
+    # Per-strike IV defaults (Brenner-Subrahmanyam warm start fallback)
+    IV_DEFAULTS = {
+        4000: 0.15, 4500: 0.18, 5000: 0.22,
+        5100: 0.25, 5200: 0.28, 5300: 0.28,
+        5400: 0.25, 5500: 0.22, 6000: 0.18, 6500: 0.15,
+    }
 
     def __init__(self, strike: int):
         super().__init__(f"VEV_{strike}", position_limit=300)
         self.strike = strike
+        self._iv0   = self.IV_DEFAULTS.get(strike, 0.20)
+
+    def _get_T(self, timestamp: int) -> float:
+        tte = (self.TOTAL_LIFE - self.CURRENT_DAY) - timestamp / 1_000_000
+        return max(1e-6, tte / self.TOTAL_LIFE)
 
     def get_orders(self, state: TradingState, saved: dict) -> Tuple[List[Order], dict]:
+
+        # ── Underlying ────────────────────────────────────────────────────
+        vf = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        if not vf or not vf.buy_orders or not vf.sell_orders:
+            return [], saved
+        S = (max(vf.buy_orders) + min(vf.sell_orders)) / 2
+
+        # ── Option book ───────────────────────────────────────────────────
         depth = state.order_depths.get(self.product)
         if not depth or not depth.buy_orders or not depth.sell_orders:
             return [], saved
 
         best_bid = max(depth.buy_orders)
         best_ask = min(depth.sell_orders)
-        spread   = best_ask - best_bid
         mid      = (best_bid + best_ask) / 2
         position = state.position.get(self.product, 0)
         ts       = state.timestamp
+        T        = self._get_T(ts)
+
         buy_cap  = self.position_limit - position
         sell_cap = self.position_limit + position
         orders: List[Order] = []
 
-        # ── EMA fair value ────────────────────────────────────────────────
-        ema = saved.get("ema", mid)
-        ema = self.EMA_A * mid + (1 - self.EMA_A) * ema
-        saved["ema"] = ema
+        # ── IV EMA ────────────────────────────────────────────────────────
+        ema_iv = saved.get("ema_iv", self._iv0)
+        live_iv = safe_implied_vol(mid, S, self.strike, T)
+        if live_iv is not None:
+            ema_iv = self.EMA_ALPHA * live_iv + (1 - self.EMA_ALPHA) * ema_iv
+        saved["ema_iv"] = ema_iv
 
-        # ── Skewed fair: soft inventory pressure ──────────────────────────
-        skewed = ema - (position / self.SKEW_DIV)
+        # ── Fair value ────────────────────────────────────────────────────
+        # For deep ITM where time value < 0.5, price at intrinsic + 1 tick
+        intrinsic = max(0.0, S - self.strike)
+        time_val  = mid - intrinsic
+        if time_val < 0.5:
+            fair = intrinsic + 0.5
+        else:
+            fair = bs_call(S, self.strike, T, ema_iv)
+
+        # Inventory skew
+        fair -= position / self.SKEW_DIV
+
+        # ── Delta for edge scaling ─────────────────────────────────────────
+        delta = bs_delta(S, self.strike, T, ema_iv)
+        # Required taker edge scales with delta: deep ITM = large edge required
+        # because underlying noise dominates. Formula: base / (1 - delta + 0.15)
+        taker_edge = self.TAKER_BASE / (1.0 - delta + 0.15)
+        taker_edge = min(taker_edge, 8.0)   # hard cap — don't require infinite edge
 
         # ══ END-OF-DAY DUMP ══════════════════════════════════════════════
         if ts >= self.DUMP_TS:
@@ -586,46 +699,38 @@ class VEV_Strategy(Strategy):
 
         # ══ NORMAL MODE ══════════════════════════════════════════════════
 
-        # ── TAKER: sweep hard dislocations ───────────────────────────────
-        if best_ask < skewed - self.ARSON_EDGE and buy_cap > 0:
-            for ask in sorted(depth.sell_orders):
-                if ask >= skewed - self.ARSON_EDGE or buy_cap <= 0:
-                    break
-                qty = min(buy_cap, abs(depth.sell_orders[ask]))
-                orders.append(self.order(ask, qty))
-                buy_cap -= qty
+        # ── TAKER: delta-adjusted edge ────────────────────────────────────
+        for ask in sorted(depth.sell_orders):
+            if ask >= fair - taker_edge or buy_cap <= 0:
+                break
+            qty = min(buy_cap, abs(depth.sell_orders[ask]))
+            orders.append(self.order(ask, qty))
+            buy_cap -= qty
 
-        elif best_bid > skewed + self.ARSON_EDGE and sell_cap > 0:
-            for bid in sorted(depth.buy_orders, reverse=True):
-                if bid <= skewed + self.ARSON_EDGE or sell_cap <= 0:
-                    break
-                qty = min(sell_cap, depth.buy_orders[bid])
-                orders.append(self.order(bid, -qty))
-                sell_cap -= qty
+        for bid in sorted(depth.buy_orders, reverse=True):
+            if bid <= fair + taker_edge or sell_cap <= 0:
+                break
+            qty = min(sell_cap, depth.buy_orders[bid])
+            orders.append(self.order(bid, -qty))
+            sell_cap -= qty
 
-        # ── MAKER: improve spread if possible, else join ──────────────────
-        if spread >= 2:
-            our_bid = best_bid + 1
-            our_ask = best_ask - 1
-        else:
-            our_bid = best_bid
-            our_ask = best_ask
+        # ── MAKER: full capacity, tight around fair ───────────────────────
+        maker_bid = math.floor(fair - self.MAKER_EDGE)
+        maker_ask = math.ceil(fair  + self.MAKER_EDGE)
 
-        # Apply soft inventory skew to quotes
-        skew_ticks = round(position / self.SKEW_DIV)
-        our_bid -= skew_ticks
-        our_ask -= skew_ticks
+        # Never cross existing market
+        maker_bid = min(maker_bid, best_ask - 1)
+        maker_ask = max(maker_ask, best_bid + 1)
 
-        # Sanity: never cross
-        our_bid = max(1, min(our_bid, best_ask - 1))
-        our_ask = max(our_ask, best_bid + 1)
-        if our_bid >= our_ask:
-            our_bid = our_ask - 1
+        if maker_bid >= maker_ask:
+            maker_bid = maker_ask - 1
+        if maker_bid < 1:
+            maker_bid = 1
 
         if buy_cap > 0:
-            orders.append(self.order(our_bid, buy_cap))
+            orders.append(self.order(maker_bid, buy_cap))
         if sell_cap > 0:
-            orders.append(self.order(our_ask, -sell_cap))
+            orders.append(self.order(maker_ask, -sell_cap))
 
         return orders, saved
 
