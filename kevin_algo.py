@@ -472,48 +472,113 @@ class VelvetfruitStrategy(Strategy):
 
         return orders, saved
 
-# black scholes helper functions
-def bs_call(S: float, K: float, T: float, sigma: float) -> float:
-    if T <= 0 or sigma <= 0:
-        return max(0.0, S - K)
-    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    return S * norm.cdf(d1) - K * norm.cdf(d2)
+def bs_fair(S, K, T, iv):
+    if T <= 1e-8 or iv <= 0: return max(0.0, S - K)
+    d1 = (math.log(S/K) + 0.5*iv*iv*T) / (iv*math.sqrt(T))
+    d2 = d1 - iv*math.sqrt(T)
+    return S*norm_cdf(d1) - K*norm_cdf(d2)
 
-def bs_vega(S: float, K: float, T: float, sigma: float) -> float:
-    if T <= 0 or sigma <= 0:
-        return 1e-8
-    d1 = (math.log(S / K) + 0.5 * sigma ** 2 * T) / (sigma * math.sqrt(T))
-    return S * norm.pdf(d1) * math.sqrt(T)
+def bs_delta(S, K, T, iv):
+    if T <= 1e-8 or iv <= 0: return 1.0 if S > K else 0.0
+    d1 = (math.log(S/K) + 0.5*iv*iv*T) / (iv*math.sqrt(T))
+    return norm_cdf(d1)
 
-def implied_vol_newton(price: float, S: float, K: float, T: float,
-                       tol: float = 1e-6, max_iter: int = 50) -> Optional[float]:
-    """Fast Newton-Raphson IV solver."""
+def fit_iv(mid, S, K, T):
     intrinsic = max(0.0, S - K)
-    if price <= intrinsic + 1e-8:
-        return None
-    sigma = 0.3  # warm start
-    for _ in range(max_iter):
-        p = bs_call(S, K, T, sigma)
-        v = bs_vega(S, K, T, sigma)
-        if v < 1e-10:
-            break
-        diff = p - price
-        sigma -= diff / v
-        sigma = max(0.001, min(sigma, 5.0))
-        if abs(diff) < tol:
-            return sigma
-    return sigma if 0.001 < sigma < 5.0 else None
+    if mid - intrinsic < 0.5 or T < 1e-8: return None
+    iv = math.sqrt(2*math.pi/T) * (mid - intrinsic) / S
+    iv = max(0.01, min(2.0, iv))
+    for _ in range(30):
+        d1 = (math.log(S/K) + 0.5*iv*iv*T) / (iv*math.sqrt(T))
+        d2 = d1 - iv*math.sqrt(T)
+        p  = S*norm_cdf(d1) - K*norm_cdf(d2)
+        v  = S*math.sqrt(T)*norm_pdf(d1)
+        if v < 1e-10: break
+        iv -= (p - mid) / v
+        iv  = max(0.01, min(2.0, iv))
+        if abs(p - mid) < 0.01: return iv
+    return iv if 0.01 < iv < 2.0 else None
+
 
 class VEV_Strategy(Strategy):
+    TOTAL_LIFE  = 8
     CURRENT_DAY = 4
-    SKEW_DIV    = 25
     DUMP_TS     = 85_000
+    SKEW_DIV    = 40
+    TAKER_EDGE  = 2.0
+    MAKER_EDGE  = 1.0
+    IV_ALPHA    = 0.15
+    MR_WINDOW   = 30
+    MR_ALPHA    = 0.05
 
-    def __init__(self, strike: int):
+    def __init__(self, strike):
         super().__init__(f"VEV_{strike}", position_limit=300)
+        self.K = strike
 
-    def get_orders(self, state: TradingState, saved: dict) -> Tuple[List[Order], dict]:
+    def _T(self, ts):
+        return max(1e-6, ((self.TOTAL_LIFE - self.CURRENT_DAY) - ts/1_000_000) / self.TOTAL_LIFE)
+
+    def _mlr_fair(self, S, T, iv, saved):
+        # Rolling MLR: regress option mid on [BS(S,K,T,iv), S, iv] using
+        # exponentially weighted covariance update (no numpy, no matrices).
+        # State: means, variances, covariances of 3 features vs target.
+        # Prediction: fair = w0*bs + w1*S_dev + w2*iv_dev + intercept
+        # where deviations are from rolling means.
+        bs = bs_fair(S, self.K, T, iv)
+        feats = [bs, S, iv]
+
+        fm  = saved.get("fm",  [bs, S, iv])
+        fv  = saved.get("fv",  [1.0, 1.0, 0.001])
+        fcv = saved.get("fcv", [1.0, 0.0, 0.0])
+        tm  = saved.get("tm",  bs)
+        a   = self.MR_ALPHA
+
+        old_fm = fm[:]
+        old_tm = tm
+
+        for i in range(3):
+            fm[i] = (1-a)*fm[i] + a*feats[i]
+        tm = (1-a)*tm + a*bs
+
+        for i in range(3):
+            df = feats[i] - old_fm[i]
+            dt = bs     - old_tm
+            fv[i]  = (1-a)*fv[i]  + a*df*df
+            fcv[i] = (1-a)*fcv[i] + a*df*dt
+
+        saved["fm"]  = fm
+        saved["fv"]  = fv
+        saved["fcv"] = fcv
+        saved["tm"]  = tm
+
+        weights = [fcv[i] / max(fv[i], 1e-8) for i in range(3)]
+        pred = sum(weights[i] * (feats[i] - fm[i]) for i in range(3)) + tm
+        return pred, bs, weights
+
+    def _mr_signal(self, fair, saved):
+        # Rolling mean reversion: track residual of (market_mid - mlr_fair)
+        # z-score the residual against its rolling std.
+        # High positive z → market overpriced → short signal
+        # High negative z → market underpriced → long signal
+        buf = saved.get("mr_buf", [])
+        buf.append(fair)
+        if len(buf) > self.MR_WINDOW:
+            buf = buf[-self.MR_WINDOW:]
+        saved["mr_buf"] = buf
+        if len(buf) < 5:
+            return 0.0
+        n    = len(buf)
+        mean = sum(buf) / n
+        var  = sum((x-mean)**2 for x in buf) / n
+        std  = math.sqrt(var) if var > 1e-10 else 1e-5
+        return (fair - mean) / std
+
+    def get_orders(self, state, saved):
+        vf = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        if not vf or not vf.buy_orders or not vf.sell_orders:
+            return [], saved
+        S = (max(vf.buy_orders) + min(vf.sell_orders)) / 2
+
         depth = state.order_depths.get(self.product)
         if not depth or not depth.buy_orders or not depth.sell_orders:
             return [], saved
@@ -523,17 +588,28 @@ class VEV_Strategy(Strategy):
         mid      = (best_bid + best_ask) / 2
         position = state.position.get(self.product, 0)
         ts       = state.timestamp
+        T        = self._T(ts)
         buy_cap  = self.position_limit - position
         sell_cap = self.position_limit + position
-        orders: List[Order] = []
+        orders   = []
 
-        buf = saved.get("b", [mid, mid, mid])
-        buf[ts % 3] = mid
-        saved["b"] = buf
-        s = sorted(buf)
-        median = s[1]
+        iv = saved.get("iv", 0.20)
+        live_iv = fit_iv(mid, S, self.K, T)
+        if live_iv:
+            iv = self.IV_ALPHA * live_iv + (1 - self.IV_ALPHA) * iv
+        saved["iv"] = iv
 
-        fair = median - (position / self.SKEW_DIV)
+        mlr_fair, bs, weights = self._mlr_fair(S, T, iv, saved)
+
+        resid = mid - mlr_fair
+        z     = self._mr_signal(resid, saved)
+
+        delta = bs_delta(S, self.K, T, iv)
+        taker_edge = max(self.TAKER_EDGE, self.TAKER_EDGE / (1 - delta + 0.15))
+        taker_edge = min(taker_edge, 10.0)
+
+        mr_bias = z * 1.5
+        fair    = mlr_fair - mr_bias - (position / self.SKEW_DIV)
 
         if ts >= self.DUMP_TS:
             if position > 0:
@@ -555,27 +631,26 @@ class VEV_Strategy(Strategy):
             return orders, saved
 
         for ask in sorted(depth.sell_orders):
-            if ask >= fair - 3 or buy_cap <= 0: break
+            if ask >= fair - taker_edge or buy_cap <= 0: break
             q = min(buy_cap, abs(depth.sell_orders[ask]))
             orders.append(self.order(ask, q))
             buy_cap -= q
 
         for bid in sorted(depth.buy_orders, reverse=True):
-            if bid <= fair + 3 or sell_cap <= 0: break
+            if bid <= fair + taker_edge or sell_cap <= 0: break
             q = min(sell_cap, depth.buy_orders[bid])
             orders.append(self.order(bid, -q))
             sell_cap -= q
 
-        skew = round(position / self.SKEW_DIV)
-        our_bid = (best_bid + 1 if best_ask - best_bid >= 2 else best_bid) - skew
-        our_ask = (best_ask - 1 if best_ask - best_bid >= 2 else best_ask) - skew
+        maker_bid = math.floor(fair - self.MAKER_EDGE)
+        maker_ask = math.ceil(fair  + self.MAKER_EDGE)
+        maker_bid = min(maker_bid, best_ask - 1)
+        maker_ask = max(maker_ask, best_bid + 1)
+        if maker_bid >= maker_ask: maker_bid = maker_ask - 1
+        if maker_bid < 1: maker_bid = 1
 
-        our_bid = max(1, min(our_bid, best_ask - 1))
-        our_ask = max(our_ask, best_bid + 1)
-        if our_bid >= our_ask: our_bid = our_ask - 1
-
-        if buy_cap > 0:  orders.append(self.order(our_bid,  buy_cap))
-        if sell_cap > 0: orders.append(self.order(our_ask, -sell_cap))
+        if buy_cap > 0:  orders.append(self.order(maker_bid,  buy_cap))
+        if sell_cap > 0: orders.append(self.order(maker_ask, -sell_cap))
 
         return orders, saved
 
