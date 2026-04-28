@@ -4,39 +4,6 @@ from round3_algo import VEV_BS_Strategy
 import math
 import json
 
-# BLACK-SCHOLES HELPERS
-def norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-def norm_pdf(x: float) -> float:
-    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
-
-def bs_call(S: float, K: float, T: float, sigma: float) -> float:
-    if T <= 1e-8 or sigma <= 0:
-        return max(0.0, S - K)
-    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    return S * norm_cdf(d1) - K * norm_cdf(d2)
-
-def bs_vega(S: float, K: float, T: float, sigma: float) -> float:
-    if T <= 1e-8: return 0.0
-    d1 = (math.log(S / K) + 0.5 * sigma**2 * T) / (sigma * math.sqrt(T))
-    return S * math.sqrt(T) * norm_pdf(d1)
-
-def implied_vol(market_price: float, S: float, K: float, T: float) -> float:
-    if T <= 1e-8: return None
-    intrinsic = max(0.0, S - K)
-    if market_price <= intrinsic + 0.01: return None
-    sigma = 0.04
-    for _ in range(50):
-        price = bs_call(S, K, T, sigma)
-        vega = bs_vega(S, K, T, sigma)
-        if vega < 1e-10: return None
-        sigma -= (price - market_price) / vega
-        if sigma <= 0.001: return None
-        if abs(price - market_price) < 0.001: return sigma
-    return None
-
 # BASE CLASS
 # all product strategies inherit from this
 # get_orders() receives a `saved` dict (loaded from traderData) and
@@ -700,7 +667,6 @@ STRATEGIES: Dict[str, Strategy] = {
 
 
 class Trader:
-
     def run(self, state: TradingState):
         try:
             saved = json.loads(state.traderData)
