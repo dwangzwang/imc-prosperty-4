@@ -508,165 +508,156 @@ def implied_vol_newton(price: float, S: float, K: float, T: float,
     return sigma if 0.001 < sigma < 5.0 else None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VEV OPTION STRATEGY — Median Reversion + Expiry Dump
+# VEV OPTION STRATEGY v4 — Pure Spread Capture + Aggressive Inventory Rotation
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Core insight: options in this sim trade around a stable intraday median.
-# We track a fast rolling median of market_mid per strike (no BS, no numpy).
-# When price deviates >EDGE above median → short it. Below → buy it.
-# Inventory skew keeps us balanced. Expiry dump forces flat near close.
+# PHILOSOPHY CHANGE from all previous versions:
+#   We have been LOSING because we keep trying to predict fair value and trade
+#   against it. Every wrong prediction pays the spread. Options are too noisy.
 #
-# Why this fixes the Day 3 blowup:
-#   - No BS fair value means no warm-start IV poison on deep OTM wings
-#   - Median anchor self-calibrates to whatever price the market is at
-#   - Hard position limits + expiry dump prevent runaway losses
-#   - Taker only fires when deviation is statistically significant (> EDGE)
-#   - All state is O(1): just 3 floats per strike in traderData
+#   New approach: EARN the spread instead of paying it.
+#   - Post at best_bid+1 and best_ask-1 every single tick on every strike
+#   - When filled long, skew quotes to sell. When filled short, skew to buy.
+#   - Inventory skew is STRONG so we rotate back to flat fast (no overnight risk)
+#   - Taker logic ONLY fires for extreme dislocations (>ARSON_EDGE ticks)
+#     where the edge is so obvious it would be criminal not to take it
+#   - End-of-day dump: flatten everything in the last 15% of timestamps
+#
+# STATE: just 1 float per strike ("ema_mid") — tiny, fast, O(1)
 
 class VEV_Strategy(Strategy):
-    TOTAL_LIFE   = 8
-    CURRENT_DAY  = 4        # ← UPDATE EACH ROUND (now day 4)
+    # ── Time ─────────────────────────────────────────────────────────────────
+    TOTAL_LIFE  = 8
+    CURRENT_DAY = 4        # ← UPDATE EACH ROUND
 
-    # Median tracker: fast EMA of mid price (replaces BS fair value entirely)
-    PRICE_ALPHA  = 0.30     # How fast median tracks (0.3 = converges in ~5 ticks)
+    # ── Spread capture ───────────────────────────────────────────────────────
+    # We always try to post inside the spread by 1 tick.
+    # QUOTE_EDGE: minimum ticks from our skewed mid to post.
+    # Keep at 0 — we want fills, not safety margin.
+    QUOTE_EDGE  = 0
 
-    # Edge: how far from median before we act
-    TAKER_EDGE   = 1.5      # Ticks deviation to sweep as taker
-    MAKER_EDGE   = 0.5      # Ticks inside median to post maker quotes
+    # ── Inventory skew ───────────────────────────────────────────────────────
+    # When long, we shade our mid DOWN by position/SKEW_DIV ticks.
+    # This makes our ask cheaper and our bid less attractive → rotates us flat.
+    # LOWER = more aggressive rotation. 20 means +300 pos → -15 tick shade.
+    SKEW_DIV    = 20
 
-    # Inventory management
-    SKEW_DIVISOR = 40       # position/this = ticks of fair value adjustment
-    MAX_POSITION = 300      # hard cap (= position_limit)
+    # ── Opportunistic taker ──────────────────────────────────────────────────
+    # Only sweep as taker when dislocation from EMA mid is HUGE.
+    # This is the "free money" threshold — don't lower it.
+    ARSON_EDGE  = 8        # ticks. Only fire if ask < ema_mid - 8 or bid > ema_mid + 8
 
-    # Expiry urgency: dump to flat in final DUMP_FRAC of the day
-    # Timestamps run 0..100_000 per day
-    DUMP_START_TS = 80_000  # start unwinding at 80% through the day
-    DUMP_EDGE     = 0       # accept ANY fill when dumping (cross spread if needed)
+    # ── EMA for taker reference ──────────────────────────────────────────────
+    # Slow EMA — only used to detect extreme dislocations for taker sweeps.
+    # Fast enough to track intraday drift, slow enough to not chase noise.
+    EMA_A       = 0.15
 
-    # Momentum filter: only take if IV has been moving our way for N ticks
-    # Set to 1 to disable (always take). Set to 3 for more selectivity.
-    MOM_TICKS    = 2
-
-    IV_DEFAULTS = {
-        4000: 50, 4500: 40, 5000: 20,
-        5100: 15, 5200: 12, 5300: 12,
-        5400: 15, 5500: 20, 6000: 40, 6500: 50,
-    }  # Default median seed in price ticks (not IV %) — rough option prices
+    # ── End of day ───────────────────────────────────────────────────────────
+    # Flatten all positions after this timestamp. Timestamps run 0–100,000/day.
+    DUMP_TS     = 85_000
 
     def __init__(self, strike: int):
         super().__init__(f"VEV_{strike}", position_limit=300)
         self.strike = strike
-        self._default_price = self.IV_DEFAULTS.get(strike, 20)
 
     def get_orders(self, state: TradingState, saved: dict) -> Tuple[List[Order], dict]:
         depth = state.order_depths.get(self.product)
         if not depth or not depth.buy_orders or not depth.sell_orders:
             return [], saved
 
-        best_bid  = max(depth.buy_orders)
-        best_ask  = min(depth.sell_orders)
-        mid       = (best_bid + best_ask) / 2
-        spread    = best_ask - best_bid
-        position  = state.position.get(self.product, 0)
-        ts        = state.timestamp
+        best_bid = max(depth.buy_orders)
+        best_ask = min(depth.sell_orders)
+        mid      = (best_bid + best_ask) / 2
+        spread   = best_ask - best_bid
+        position = state.position.get(self.product, 0)
+        ts       = state.timestamp
 
-        # ── Rolling median via fast EMA ───────────────────────────────────
-        median = saved.get("median", self._default_price)
-        median = self.PRICE_ALPHA * mid + (1 - self.PRICE_ALPHA) * median
-        saved["median"] = median
-
-        # ── Momentum filter: track direction of last MOM_TICKS deviations ─
-        # Store sign of (mid - median) for last N ticks
-        mom_buf = saved.get("mom", [])
-        mom_buf.append(1 if mid > median else -1)
-        if len(mom_buf) > self.MOM_TICKS:
-            mom_buf = mom_buf[-self.MOM_TICKS:]
-        saved["mom"] = mom_buf
-        mom_signal = sum(mom_buf)  # positive → consistently above median (short signal)
-
-        # ── Inventory skew on fair value ──────────────────────────────────
-        fair = median - (position / self.SKEW_DIVISOR)
-
-        buy_cap  = self.MAX_POSITION - position
-        sell_cap = self.MAX_POSITION + position
+        buy_cap  = self.position_limit - position
+        sell_cap = self.position_limit + position
         orders: List[Order] = []
 
-        # ══ EXPIRY DUMP MODE ════════════════════════════════════════════════
-        # Near end of day, aggressively flatten all positions to zero.
-        # We CANNOT hold options overnight — theta decay will kill us.
-        if ts >= self.DUMP_START_TS:
+        # ── EMA mid (taker reference only) ───────────────────────────────
+        ema = saved.get("ema", mid)
+        ema = self.EMA_A * mid + (1 - self.EMA_A) * ema
+        saved["ema"] = ema
+
+        # ══ END-OF-DAY DUMP ══════════════════════════════════════════════════
+        # Flatten unconditionally — cross the spread if we have to.
+        if ts >= self.DUMP_TS:
             if position > 0:
-                # Dump longs: hit every bid we can
+                # Hit every bid level until flat
+                remaining = position
                 for bid in sorted(depth.buy_orders, reverse=True):
-                    qty = min(position, depth.buy_orders[bid])
-                    if qty > 0:
-                        orders.append(self.order(bid, -qty))
-                        position -= qty
-                    if position <= 0:
+                    if remaining <= 0:
                         break
-                # If book not deep enough, post at best_bid to guarantee fill
-                if position > 0:
-                    orders.append(self.order(best_bid, -position))
-
+                    qty = min(remaining, depth.buy_orders[bid])
+                    orders.append(self.order(bid, -qty))
+                    remaining -= qty
+                # Still not flat? Post aggressively below best bid
+                if remaining > 0:
+                    orders.append(self.order(best_bid - 1, -remaining))
             elif position < 0:
-                # Cover shorts: lift every ask we can
-                to_cover = -position
+                remaining = -position
                 for ask in sorted(depth.sell_orders):
-                    qty = min(to_cover, abs(depth.sell_orders[ask]))
-                    if qty > 0:
-                        orders.append(self.order(ask, qty))
-                        to_cover -= qty
-                    if to_cover <= 0:
+                    if remaining <= 0:
                         break
-                if to_cover > 0:
-                    orders.append(self.order(best_ask, to_cover))
-
+                    qty = min(remaining, abs(depth.sell_orders[ask]))
+                    orders.append(self.order(ask, qty))
+                    remaining -= qty
+                if remaining > 0:
+                    orders.append(self.order(best_ask + 1, remaining))
             return orders, saved
 
-        # ══ NORMAL TRADING MODE ══════════════════════════════════════════════
+        # ══ NORMAL MODE ══════════════════════════════════════════════════════
 
-        # ── TAKER: sweep when deviation is large AND momentum confirms ────
-        deviation = mid - fair
+        # ── Skewed mid: long pos shades down, short pos shades up ─────────
+        skewed_mid = mid - (position / self.SKEW_DIV)
 
-        # Short signal: mid is significantly above fair, momentum confirms up
-        if deviation > self.TAKER_EDGE and mom_signal > 0 and sell_cap > 0:
-            for bid in sorted(depth.buy_orders, reverse=True):
-                if bid < fair + self.TAKER_EDGE or sell_cap <= 0:
-                    break
-                qty = min(sell_cap, depth.buy_orders[bid])
-                orders.append(self.order(bid, -qty))
-                sell_cap -= qty
-
-        # Buy signal: mid is significantly below fair, momentum confirms down
-        elif deviation < -self.TAKER_EDGE and mom_signal < 0 and buy_cap > 0:
+        # ── TAKER: only on extreme dislocations from slow EMA ─────────────
+        # This fires maybe 2-3x per day per strike — only when it's obvious.
+        if best_ask < ema - self.ARSON_EDGE and buy_cap > 0:
             for ask in sorted(depth.sell_orders):
-                if ask > fair - self.TAKER_EDGE or buy_cap <= 0:
+                if ask >= ema - self.ARSON_EDGE or buy_cap <= 0:
                     break
                 qty = min(buy_cap, abs(depth.sell_orders[ask]))
                 orders.append(self.order(ask, qty))
                 buy_cap -= qty
 
-        # ── MAKER: tight quotes around fair value ─────────────────────────
-        # Post at best_bid+1 and best_ask-1 when spread allows,
-        # but never tighter than MAKER_EDGE from our fair value.
-        maker_bid = min(best_bid + 1, math.floor(fair - self.MAKER_EDGE))
-        maker_ask = max(best_ask - 1, math.ceil(fair  + self.MAKER_EDGE))
+        elif best_bid > ema + self.ARSON_EDGE and sell_cap > 0:
+            for bid in sorted(depth.buy_orders, reverse=True):
+                if bid <= ema + self.ARSON_EDGE or sell_cap <= 0:
+                    break
+                qty = min(sell_cap, depth.buy_orders[bid])
+                orders.append(self.order(bid, -qty))
+                sell_cap -= qty
 
-        # Hard sanity: never cross the spread
-        maker_bid = min(maker_bid, best_ask - 1)
-        maker_ask = max(maker_ask, best_bid + 1)
+        # ── MAKER: post inside the spread, skewed by inventory ────────────
+        # Target: best_bid+1 and best_ask-1 (improve the market).
+        # But cap by skewed mid so we don't quote on the wrong side of fair.
+        if spread >= 2:
+            # There's room to improve inside
+            our_bid = best_bid + 1
+            our_ask = best_ask - 1
+        else:
+            # Spread is 1 tick — just join best bid/ask
+            our_bid = best_bid
+            our_ask = best_ask
 
-        if maker_bid >= maker_ask:
-            maker_bid = maker_ask - 1
+        # Apply skew: long position → lower bid AND lower ask to push sells
+        skew_ticks = int(position / self.SKEW_DIV)
+        our_bid -= skew_ticks
+        our_ask -= skew_ticks
 
-        # Scale maker size to remaining capacity (don't slam full cap on maker)
-        maker_buy_qty  = min(buy_cap,  max(1, buy_cap  // 2))
-        maker_sell_qty = min(sell_cap, max(1, sell_cap // 2))
+        # Hard sanity guards
+        our_bid = max(1, our_bid)
+        our_ask = max(our_bid + 1, our_ask)
 
-        if maker_bid >= 1 and buy_cap > 0:
-            orders.append(self.order(maker_bid, maker_buy_qty))
+        # Size: use FULL remaining capacity on maker quotes.
+        # We WANT to be filled — that's the whole point.
+        if buy_cap > 0:
+            orders.append(self.order(our_bid, buy_cap))
         if sell_cap > 0:
-            orders.append(self.order(maker_ask, -maker_sell_qty))
+            orders.append(self.order(our_ask, -sell_cap))
 
         return orders, saved
 
