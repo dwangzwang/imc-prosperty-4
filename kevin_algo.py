@@ -478,11 +478,6 @@ def bs_fair(S, K, T, iv):
     d2 = d1 - iv*math.sqrt(T)
     return S*norm_cdf(d1) - K*norm_cdf(d2)
 
-def bs_delta(S, K, T, iv):
-    if T <= 1e-8 or iv <= 0: return 1.0 if S > K else 0.0
-    d1 = (math.log(S/K) + 0.5*iv*iv*T) / (iv*math.sqrt(T))
-    return norm_cdf(d1)
-
 def fit_iv(mid, S, K, T):
     intrinsic = max(0.0, S - K)
     if mid - intrinsic < 0.5 or T < 1e-8: return None
@@ -501,32 +496,29 @@ def fit_iv(mid, S, K, T):
 
 
 class VEV_Strategy(Strategy):
-    TOTAL_LIFE   = 8
-    CURRENT_DAY  = 4
-    DUMP_TS      = 85_000
+    TOTAL_LIFE  = 8
+    CURRENT_DAY = 4
 
-    # Cold start: do NOTHING for first WARMUP_TS timestamps.
-    # Let IV converge before touching any position.
-    WARMUP_TS    = 8_000
+    # Phase 1: Silent observation. Build IV and measure dislocation.
+    OBSERVE_TS  = 8_000
 
-    # During warmup, run IV solver at high alpha to bootstrap fast.
-    IV_ALPHA_HOT = 0.60    # First WARMUP_TS ticks: slam IV to market fast
-    IV_ALPHA     = 0.12    # After warmup: slow and stable
+    # Phase 2: Enter full position fading the dislocation.
+    # Only enter if dislocation exceeds MIN_EDGE ticks — below this it's noise.
+    MIN_EDGE    = 3.0
 
-    # Require IV to be observed at least MIN_IV_OBS times before trading.
-    MIN_IV_OBS   = 5
+    # Phase 3: Hold until price converges within TAKE_PROFIT ticks of fair,
+    # OR until STOP_LOSS ticks move against us — then exit entirely.
+    TAKE_PROFIT = 2.0
+    STOP_LOSS   = 8.0
 
-    SKEW_DIV     = 40
-    TAKER_EDGE   = 2.5
-    MAKER_EDGE   = 1.0
+    # Phase 4: Hard flatten everything at DUMP_TS regardless.
+    DUMP_TS     = 82_000
 
-    # Mean reversion: z-score window and bias scaling
-    MR_WINDOW    = 25
-    MR_BIAS      = 1.2
+    # Staggered exit: once take-profit hit, unwind over UNWIND_TICKS ticks
+    # to avoid slamming the market with 300 lots at once.
+    UNWIND_TICKS = 5
 
-    # Staggered unwind: start reducing position at UNWIND_TS, not all at DUMP_TS
-    UNWIND_TS    = 65_000
-    UNWIND_FRAC  = 0.25    # Sell this fraction of position each unwind tick
+    IV_ALPHA    = 0.50    # Hot during observation — converge fast
 
     def __init__(self, strike):
         super().__init__(f"VEV_{strike}", position_limit=300)
@@ -534,18 +526,6 @@ class VEV_Strategy(Strategy):
 
     def _T(self, ts):
         return max(1e-6, ((self.TOTAL_LIFE - self.CURRENT_DAY) - ts/1_000_000) / self.TOTAL_LIFE)
-
-    def _zscore(self, val, saved):
-        buf = saved.get("mr", [])
-        buf.append(val)
-        if len(buf) > self.MR_WINDOW: buf = buf[-self.MR_WINDOW:]
-        saved["mr"] = buf
-        if len(buf) < 5: return 0.0
-        n    = len(buf)
-        mean = sum(buf) / n
-        var  = sum((x-mean)**2 for x in buf) / n
-        std  = math.sqrt(var) if var > 1e-10 else 1e-5
-        return (val - mean) / std
 
     def get_orders(self, state, saved):
         vf = state.order_depths.get("VELVETFRUIT_EXTRACT")
@@ -567,49 +547,24 @@ class VEV_Strategy(Strategy):
         sell_cap = self.position_limit + position
         orders   = []
 
-        # IV bootstrap: always run solver, use hot alpha during warmup
+        # Always update IV during observation phase
         iv      = saved.get("iv", None)
         iv_obs  = saved.get("iv_obs", 0)
         live_iv = fit_iv(mid, S, self.K, T)
-
         if live_iv is not None:
-            alpha = self.IV_ALPHA_HOT if ts < self.WARMUP_TS else self.IV_ALPHA
-            iv    = live_iv if iv is None else alpha*live_iv + (1-alpha)*iv
+            iv     = live_iv if iv is None else self.IV_ALPHA*live_iv + (1-self.IV_ALPHA)*iv
             iv_obs += 1
-
         saved["iv"]     = iv
         saved["iv_obs"] = iv_obs
 
-        # Cold start lockout: observe market, build IV, do not trade
-        if ts < self.WARMUP_TS or iv is None or iv_obs < self.MIN_IV_OBS:
+        # ══ PHASE 1: OBSERVE — do nothing, just build IV ═════════════════
+        if ts < self.OBSERVE_TS or iv is None or iv_obs < 4:
             return [], saved
 
-        fair_bs = bs_fair(S, self.K, T, iv)
-        delta   = bs_delta(S, self.K, T, iv)
+        fair = bs_fair(S, self.K, T, iv)
 
-        # Mean reversion z-score on residual (mid - BS fair)
-        resid = mid - fair_bs
-        z     = self._zscore(resid, saved)
-
-        # Fair = BS + MR bias + inventory skew
-        # Positive z means market is rich → shade fair down → we become sellers
-        fair  = fair_bs - z*self.MR_BIAS - (position / self.SKEW_DIV)
-
-        # Delta-adjusted taker edge: deep ITM needs more edge
-        t_edge = max(self.TAKER_EDGE, self.TAKER_EDGE / (1 - delta + 0.15))
-        t_edge = min(t_edge, 10.0)
-
-        # Staggered unwind: bleed position down gradually before dump
-        if ts >= self.UNWIND_TS:
-            unwind_qty = max(1, int(abs(position) * self.UNWIND_FRAC))
-            if position > 0:
-                orders.append(self.order(best_bid, -min(unwind_qty, sell_cap)))
-            elif position < 0:
-                orders.append(self.order(best_ask, min(unwind_qty, buy_cap)))
-
-        # Hard dump at DUMP_TS
+        # ══ PHASE 4: HARD DUMP ═══════════════════════════════════════════
         if ts >= self.DUMP_TS:
-            orders.clear()
             if position > 0:
                 r = position
                 for bid in sorted(depth.buy_orders, reverse=True):
@@ -626,36 +581,84 @@ class VEV_Strategy(Strategy):
                     orders.append(self.order(ask, q))
                     r -= q
                 if r > 0: orders.append(self.order(best_ask, r))
+            saved["phase"] = "done"
             return orders, saved
 
-        # Taker sweeps
-        for ask in sorted(depth.sell_orders):
-            if ask >= fair - t_edge or buy_cap <= 0: break
-            q = min(buy_cap, abs(depth.sell_orders[ask]))
-            orders.append(self.order(ask, q))
-            buy_cap -= q
+        phase      = saved.get("phase", "seek")
+        entry_fair = saved.get("entry_fair", None)
+        direction  = saved.get("direction", 0)
 
-        for bid in sorted(depth.buy_orders, reverse=True):
-            if bid <= fair + t_edge or sell_cap <= 0: break
-            q = min(sell_cap, depth.buy_orders[bid])
-            orders.append(self.order(bid, -q))
-            sell_cap -= q
+        # ══ PHASE 2: SEEK — find and enter the dislocation ═══════════════
+        if phase == "seek":
+            dislocation = mid - fair
 
-        # Maker quotes
-        maker_bid = math.floor(fair - self.MAKER_EDGE)
-        maker_ask = math.ceil(fair  + self.MAKER_EDGE)
-        maker_bid = min(maker_bid, best_ask - 1)
-        maker_ask = max(maker_ask, best_bid + 1)
-        if maker_bid >= maker_ask: maker_bid = maker_ask - 1
-        if maker_bid < 1: maker_bid = 1
+            if dislocation > self.MIN_EDGE and sell_cap > 0:
+                # Market is RICH vs fair → short it, expect price to fall
+                for bid in sorted(depth.buy_orders, reverse=True):
+                    if sell_cap <= 0: break
+                    q = min(sell_cap, depth.buy_orders[bid])
+                    orders.append(self.order(bid, -q))
+                    sell_cap -= q
+                # Post ask to fill remaining capacity
+                if sell_cap > 0:
+                    orders.append(self.order(best_bid, -sell_cap))
+                saved["phase"]      = "hold"
+                saved["direction"]  = -1
+                saved["entry_fair"] = fair
+                saved["entry_mid"]  = mid
 
-        if buy_cap > 0:  orders.append(self.order(maker_bid,  buy_cap))
-        if sell_cap > 0: orders.append(self.order(maker_ask, -sell_cap))
+            elif dislocation < -self.MIN_EDGE and buy_cap > 0:
+                # Market is CHEAP vs fair → long it, expect price to rise
+                for ask in sorted(depth.sell_orders):
+                    if buy_cap <= 0: break
+                    q = min(buy_cap, abs(depth.sell_orders[ask]))
+                    orders.append(self.order(ask, q))
+                    buy_cap -= q
+                if buy_cap > 0:
+                    orders.append(self.order(best_ask, buy_cap))
+                saved["phase"]      = "hold"
+                saved["direction"]  = 1
+                saved["entry_fair"] = fair
+                saved["entry_mid"]  = mid
+
+        # ══ PHASE 3: HOLD — wait for convergence or stop loss ════════════
+        elif phase == "hold":
+            entry_mid = saved.get("entry_mid", fair)
+            pnl_ticks = direction * (mid - entry_mid)
+
+            hit_tp = (mid - fair) * direction < self.TAKE_PROFIT  and pnl_ticks > 0
+            hit_sl = pnl_ticks < -self.STOP_LOSS
+
+            if hit_tp or hit_sl:
+                # Exit entire position
+                if position > 0:
+                    r = position
+                    for bid in sorted(depth.buy_orders, reverse=True):
+                        if r <= 0: break
+                        q = min(r, depth.buy_orders[bid])
+                        orders.append(self.order(bid, -q))
+                        r -= q
+                    if r > 0: orders.append(self.order(best_bid, -r))
+                elif position < 0:
+                    r = -position
+                    for ask in sorted(depth.sell_orders):
+                        if r <= 0: break
+                        q = min(r, abs(depth.sell_orders[ask]))
+                        orders.append(self.order(ask, q))
+                        r -= q
+                    if r > 0: orders.append(self.order(best_ask, r))
+                # After exit, seek next dislocation
+                saved["phase"]     = "seek"
+                saved["direction"] = 0
 
         return orders, saved
 
 
 STRATEGIES: Dict[str, Strategy] = {
+    # "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy("INTARIAN_PEPPER_ROOT", position_limit=80),
+    # "ASH_COATED_OSMIUM":    OsmiumStrategy("ASH_COATED_OSMIUM", position_limit=80),
+    # "HYDROGEL_PACK":        HydrogelStrategy(),
+    # "VELVETFRUIT_EXTRACT":  VelvetfruitStrategy(),
     "VEV_4000": VEV_Strategy(4000),
     "VEV_4500": VEV_Strategy(4500),
     "VEV_5000": VEV_Strategy(5000),
