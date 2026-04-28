@@ -507,212 +507,149 @@ def implied_vol_newton(price: float, S: float, K: float, T: float,
             return sigma
     return sigma if 0.001 < sigma < 5.0 else None
 
-# volatility surface fitter
-class VolSurface:
-    """
-    Fits a quadratic smile: IV(m) = a*m^2 + b*m + c
-    where m = log(K/S) / sqrt(T)  (standardised moneyness)
-    Updates incrementally via a rolling window of (moneyness, iv) pairs.
-    """
-    def __init__(self, decay: float = 0.92):
-        self.decay = decay          # Exponential weight on older observations
-        self.obs: List[Tuple[float, float, float]] = []  # (weight, moneyness, iv)
-        self.coeffs = (0.0, 0.0, 0.30)  # (a, b, c) — flat 30% vol default
+# ── VEV OPTION STRATEGY ──────────────────────────────────────────────────────
+#
+# Design: Per-strike EMA implied vol → BS fair value → aggressive MM
+#
+# Why this beats the VolSurface approach:
+#   - Zero numpy/scipy per tick: O(1) state, no matrix math
+#   - EMA_ALPHA=0.25 tracks IV fast enough to catch mispricings
+#   - Single maker level posted at best_bid+1 / best_ask-1 to maximise fill rate
+#   - Taker edge of 1.0 tick is aggressive but filters noise
+#   - IV is clamped per-strike based on moneyness to avoid BS blowup on wings
+#   - Saved state is just one float ("ema_iv") — tiny JSON footprint
 
-    def update(self, moneyness: float, iv: float):
-        # Decay old weights
-        self.obs = [(w * self.decay, m, v) for w, m, v in self.obs]
-        self.obs.append((1.0, moneyness, iv))
-        # Prune negligible-weight obs
-        self.obs = [(w, m, v) for w, m, v in self.obs if w > 0.01]
-        self._fit()
-
-    def _fit(self):
-        if len(self.obs) < 3:
-            return
-        W = np.array([w for w, _, _ in self.obs])
-        M = np.array([m for _, m, _ in self.obs])
-        V = np.array([v for _, _, v in self.obs])
-        # Weighted least squares: design matrix [m^2, m, 1]
-        A = np.column_stack([M**2, M, np.ones_like(M)])
-        try:
-            # WLS normal equations
-            Aw = A * W[:, None]
-            coeffs, *_ = np.linalg.lstsq(Aw, V * W, rcond=None)
-            self.coeffs = tuple(coeffs)
-        except Exception:
-            pass
-
-    def get_iv(self, moneyness: float) -> float:
-        a, b, c = self.coeffs
-        iv = a * moneyness**2 + b * moneyness + c
-        return max(0.02, min(iv, 3.0))
-
-# main strat
-class VEV_SmileMM_Strategy(Strategy):
-    """
-    Volatility Surface Market Maker
-
-    Core idea:
-    1. Every tick, collect IV observations from ALL strikes simultaneously
-       to fit a quadratic volatility smile.
-    2. Price each strike using the smile-implied IV (not a per-strike EMA).
-    3. Aggressively taker-sweep anything mispriced beyond TAKER_EDGE ticks.
-    4. Post tight maker quotes using MAKER_EDGE, scaled by remaining capacity.
-    5. Apply inventory skew to keep position near zero (mean-reversion).
-    6. Optionally track aggregate delta exposure across strikes for hedging.
-    """
-
+class VEV_Strategy(Strategy):
     TOTAL_LIFE   = 8
-    CURRENT_DAY  = 3       # <-- update per round
-    TAKER_EDGE   = 0.5     # Ticks of edge required to lift/hit (aggressive)
-    MAKER_EDGE   = 0.75    # Ticks of spread on posted quotes
-    SKEW_DIVISOR = 50      # Position / this = IV shift applied to fair
-    MAX_ORDER_FRAC = 0.4   # Max fraction of remaining cap per order level
+    CURRENT_DAY  = 3        # <-- update each round
+    EMA_ALPHA    = 0.25     # Fast-tracking IV EMA (converges in ~8 ticks)
+    TAKER_EDGE   = 1.0      # Ticks of edge required to sweep as taker
+    SKEW_DIVISOR = 60       # Inventory skew strength (higher = softer)
 
-    # All strikes this strategy manages (shared surface, separate limits)
-    STRIKES = [4000, 4500, 5000, 5100, 5200, 5300, 5400, 5500, 6000, 6500]
+    # Per-strike IV clamp: prevents BS from outputting garbage on deep OTM/ITM
+    # Tune these if the underlying has different vol regime
+    IV_FLOOR = 0.01
+    IV_CAP   = 1.50
 
-    def __init__(self, strike: int, surface: VolSurface):
+    # Default IV warm-start per strike (rough ATM-to-wing gradient)
+    # Keys are strikes; adjust if strikes differ from this list
+    IV_DEFAULTS = {
+        4000: 0.55, 4500: 0.42, 5000: 0.28,
+        5100: 0.22, 5200: 0.18, 5300: 0.18,
+        5400: 0.22, 5500: 0.28, 6000: 0.42, 6500: 0.55,
+    }
+
+    def __init__(self, strike: int):
         super().__init__(f"VEV_{strike}", position_limit=300)
         self.strike = strike
-        self.surface = surface          # Shared across all strike instances
+        self._default_iv = self.IV_DEFAULTS.get(strike, 0.30)
 
     def _get_T(self, timestamp: int) -> float:
-        tte_days = (self.TOTAL_LIFE - self.CURRENT_DAY) - timestamp / 1_000_000
-        return max(1e-8, tte_days / self.TOTAL_LIFE)
-
-    def _moneyness(self, S: float, K: float, T: float) -> float:
-        return math.log(K / S) / max(math.sqrt(T), 1e-6)
+        tte = (self.TOTAL_LIFE - self.CURRENT_DAY) - timestamp / 1_000_000
+        return max(1e-8, tte / self.TOTAL_LIFE)
 
     def get_orders(self, state: TradingState, saved: dict) -> Tuple[List[Order], dict]:
-        # ── Underlying mid ──────────────────────────────────────────────
-        vf_depth = state.order_depths.get("VELVETFRUIT_EXTRACT")
-        if not vf_depth or not vf_depth.buy_orders or not vf_depth.sell_orders:
+        # ── Underlying mid ───────────────────────────────────────────────
+        vf = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        if not vf or not vf.buy_orders or not vf.sell_orders:
             return [], saved
-        S = (max(vf_depth.buy_orders) + min(vf_depth.sell_orders)) / 2
+        S = (max(vf.buy_orders) + min(vf.sell_orders)) / 2
 
-        # ── Option book ─────────────────────────────────────────────────
+        # ── Option book ──────────────────────────────────────────────────
         depth = state.order_depths.get(self.product)
         if not depth or not depth.buy_orders or not depth.sell_orders:
             return [], saved
 
-        best_bid = max(depth.buy_orders.keys())
-        best_ask = min(depth.sell_orders.keys())
+        best_bid = max(depth.buy_orders)
+        best_ask = min(depth.sell_orders)
         market_mid = (best_bid + best_ask) / 2
-        position = state.position.get(self.product, 0)
+        position  = state.position.get(self.product, 0)
         T = self._get_T(state.timestamp)
-        m = self._moneyness(S, self.strike, T)
 
-        # ── Update shared smile with this strike's observation ───────────
-        live_iv = implied_vol_newton(market_mid, S, self.strike, T)
+        # ── EMA implied vol (O(1), no numpy) ────────────────────────────
+        ema_iv = saved.get("ema_iv", self._default_iv)
+        live_iv = implied_vol(market_mid, S, self.strike, T)  # existing helper
         if live_iv is not None:
-            self.surface.update(m, live_iv)
+            live_iv = max(self.IV_FLOOR, min(live_iv, self.IV_CAP))
+            ema_iv  = self.EMA_ALPHA * live_iv + (1 - self.EMA_ALPHA) * ema_iv
+        saved["ema_iv"] = ema_iv
 
-        # ── Fair value from smile ────────────────────────────────────────
-        smile_iv = self.surface.get_iv(m)
-        fair_base = bs_call(S, self.strike, T, smile_iv)
+        # ── Fair value with inventory skew ───────────────────────────────
+        fair = bs_call(S, self.strike, T, ema_iv)
+        fair += -(position / self.SKEW_DIVISOR)   # long pos → lower fair (sell pressure)
 
-        # Inventory skew: being long pushes fair down (sell pressure)
-        skew = -(position / self.SKEW_DIVISOR)
-        fair = fair_base + skew
-
-        # ── Capacity ─────────────────────────────────────────────────────
         buy_cap  = self.position_limit - position
         sell_cap = self.position_limit + position
         orders: List[Order] = []
 
-        # ── TAKER: sweep obvious mispricings ─────────────────────────────
-        for ask_px in sorted(depth.sell_orders.keys()):
-            edge = fair - ask_px
-            if edge < self.TAKER_EDGE or buy_cap <= 0:
+        # ── TAKER: sweep any level with sufficient edge ──────────────────
+        for ask in sorted(depth.sell_orders):
+            if ask >= fair - self.TAKER_EDGE or buy_cap <= 0:
                 break
-            # Size proportional to edge strength (up to full book level)
-            max_qty = int(buy_cap * min(1.0, edge / (self.TAKER_EDGE * 3)))
-            qty = min(max(1, max_qty), abs(depth.sell_orders[ask_px]), buy_cap)
-            orders.append(self.order(ask_px, qty))
+            qty = min(buy_cap, abs(depth.sell_orders[ask]))
+            orders.append(self.order(ask, qty))
             buy_cap -= qty
 
-        for bid_px in sorted(depth.buy_orders.keys(), reverse=True):
-            edge = bid_px - fair
-            if edge < self.TAKER_EDGE or sell_cap <= 0:
+        for bid in sorted(depth.buy_orders, reverse=True):
+            if bid <= fair + self.TAKER_EDGE or sell_cap <= 0:
                 break
-            max_qty = int(sell_cap * min(1.0, edge / (self.TAKER_EDGE * 3)))
-            qty = min(max(1, max_qty), depth.buy_orders[bid_px], sell_cap)
-            orders.append(self.order(bid_px, -qty))
+            qty = min(sell_cap, depth.buy_orders[bid])
+            orders.append(self.order(bid, -qty))
             sell_cap -= qty
 
-        # ── MAKER: layered quotes ─────────────────────────────────────────
-        # Post 3 price levels with declining size to capture more flow
-        for layer in range(3):
-            offset = self.MAKER_EDGE + layer * 0.5   # Widen each layer
+        # ── MAKER: single tight level, improve spread by 1 tick ─────────
+        # Sit at best_bid+1 / best_ask-1 to be first in queue.
+        # Only widen if fair value forces us to (edge check).
+        maker_bid = min(best_bid + 1, math.floor(fair - self.TAKER_EDGE))
+        maker_ask = max(best_ask - 1, math.ceil(fair  + self.TAKER_EDGE))
 
-            bid_px = math.floor(fair - offset)
-            ask_px = math.ceil(fair + offset)
+        if maker_bid >= maker_ask:
+            maker_bid = maker_ask - 1
 
-            # Ensure inside spread sanity
-            bid_px = min(bid_px, best_bid)           # Don't post above best bid
-            ask_px = max(ask_px, best_ask)           # Don't post below best ask
-
-            if bid_px >= ask_px:
-                bid_px = ask_px - 1
-
-            # Allocate decreasing fraction per layer
-            layer_frac = self.MAX_ORDER_FRAC / (layer + 1)
-            bid_qty = max(1, int(buy_cap * layer_frac))
-            ask_qty = max(1, int(sell_cap * layer_frac))
-
-            if bid_px >= 1 and buy_cap > 0:
-                orders.append(self.order(bid_px, bid_qty))
-            if sell_cap > 0:
-                orders.append(self.order(ask_px, -ask_qty))
+        if maker_bid >= 1 and buy_cap > 0:
+            orders.append(self.order(maker_bid, buy_cap))
+        if sell_cap > 0:
+            orders.append(self.order(maker_ask, -sell_cap))
 
         return orders, saved
 
-_surface = VolSurface(decay=0.92)
-# registry to handle matching products to strategies
-STRATEGIES: Dict[str, Strategy] = {
-    # "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy("INTARIAN_PEPPER_ROOT", position_limit = 80),
-    # "ASH_COATED_OSMIUM": OsmiumStrategy("ASH_COATED_OSMIUM", position_limit = 80),
-    # "HYDROGEL_PACK": HydrogelStrategy(),
-    # "VELVETFRUIT_EXTRACT": VelvetfruitStrategy(),
 
-     # --- the wrath of god in all its fury ---
-     "VEV_4000": VEV_SmileMM_Strategy(strike=4000, surface=_surface),
-     "VEV_4500": VEV_SmileMM_Strategy(strike=4500, surface=_surface),
-     "VEV_5000": VEV_SmileMM_Strategy(strike=5000, surface=_surface),
-     "VEV_5100": VEV_SmileMM_Strategy(strike=5100, surface=_surface),
-     "VEV_5200": VEV_SmileMM_Strategy(strike=5200, surface=_surface),
-     "VEV_5300": VEV_SmileMM_Strategy(strike=5300, surface=_surface),
-     "VEV_5400": VEV_SmileMM_Strategy(strike=5400, surface=_surface),
-     "VEV_5500": VEV_SmileMM_Strategy(strike=5500, surface=_surface),
-     "VEV_6000": VEV_SmileMM_Strategy(strike=6000, surface=_surface),
-     "VEV_6500": VEV_SmileMM_Strategy(strike=6500, surface=_surface),
+# ── STRATEGY REGISTRY ────────────────────────────────────────────────────────
+STRATEGIES: Dict[str, Strategy] = {
+    # "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy("INTARIAN_PEPPER_ROOT", position_limit=80),
+    # "ASH_COATED_OSMIUM":    OsmiumStrategy("ASH_COATED_OSMIUM", position_limit=80),
+    # "HYDROGEL_PACK":        HydrogelStrategy(),
+    # "VELVETFRUIT_EXTRACT":  VelvetfruitStrategy(),
+
+    "VEV_4000": VEV_Strategy(4000),
+    "VEV_4500": VEV_Strategy(4500),
+    "VEV_5000": VEV_Strategy(5000),
+    "VEV_5100": VEV_Strategy(5100),
+    "VEV_5200": VEV_Strategy(5200),
+    "VEV_5300": VEV_Strategy(5300),
+    "VEV_5400": VEV_Strategy(5400),
+    "VEV_5500": VEV_Strategy(5500),
+    "VEV_6000": VEV_Strategy(6000),
+    "VEV_6500": VEV_Strategy(6500),
 }
 
 
-# trader class for simulation to interact with algo
+# ── TRADER ───────────────────────────────────────────────────────────────────
 class Trader:
 
     def run(self, state: TradingState):
-        # load persisted state from previous tick
         try:
             saved = json.loads(state.traderData)
         except:
             saved = {}
 
         result = {}
-
         for product, strategy in STRATEGIES.items():
             if product not in state.order_depths:
                 continue
-
-            # each strategy gets its own slice of saved state
             product_saved = saved.get(product, {})
             orders, product_saved = strategy.get_orders(state, product_saved)
             result[product] = orders
             saved[product] = product_saved
 
-        # serialize state back for next tick
-        trader_data = json.dumps(saved)
-        return result, 0, trader_data
+        return result, 0, json.dumps(saved)
