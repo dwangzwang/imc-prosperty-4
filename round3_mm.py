@@ -25,16 +25,8 @@ class HydrogelStrategy(Strategy):
     SKEW_DIV    = 30      # inventory skew divisor
     EDGE        = 10       # maker half-spread
     MM_SIZE     = 30      # base quote size per side
-
     MR_THRESH   = 30       # ticks from mean to trigger MR taker
     MR_SIZE     = 20      # units per MR order
-
-    LADDER_LEVELS = [
-        (20, 15),   # (ticks below/above mean, size)
-        (35, 20),
-        (55, 25),
-        (80, 30),
-    ]
 
     def __init__(self):
         super().__init__("HYDROGEL_PACK", position_limit=200)
@@ -97,30 +89,42 @@ class HydrogelStrategy(Strategy):
 
         # Suppress maker side that fights the MR signal
         if buy_size > 0 and buy_cap > 0 and mr_bias < self.MR_THRESH:
-            orders.append(self.order(our_bid, buy_size))
+            orders.append(self.order(our_bid, buy_size/2))
+            orders.append(self.order(our_bid, buy_size/2))
         if sell_size > 0 and sell_cap > 0 and mr_bias > -self.MR_THRESH:
-            orders.append(self.order(our_ask, -sell_size))
+            orders.append(self.order(our_ask, -sell_size/2))
+            orders.append(self.order(our_ask, -sell_size/2))
 
     
 
         # MR taker
         deviation = wall_mid - mean
+
         if deviation < -self.MR_THRESH and buy_cap > 0:
-            orders.append(self.order(best_ask, min(self.MR_SIZE, buy_cap)))
+            orders.append(self.order(best_ask, min(self.MR_SIZE, buy_cap)/2))
+            orders.append(self.order(best_ask, min(self.MR_SIZE, buy_cap)/2))
         elif deviation > self.MR_THRESH and sell_cap > 0:
-            orders.append(self.order(best_bid, -min(self.MR_SIZE, sell_cap)))
+            orders.append(self.order(best_bid, -min(self.MR_SIZE, sell_cap)/2))
+            orders.append(self.order(best_bid, -min(self.MR_SIZE, sell_cap)/2))
 
         return orders, saved
 
 class VelvetfruitStrategy(Strategy):
+    # Market Making & Smoothing
     WALL_VOL   = 10
     EMA_ALPHA  = 0.12
-    MEAN_ALPHA = 0.0001  # anchored at first tick price, not 10k
+    MEAN_ALPHA = 0.0001 
     SKEW_DIV   = 50
     EDGE       = 1
     MM_SIZE    = 30
+
+    # Mean Reversion
     MR_THRESH  = 30
     MR_SIZE    = 20
+
+    # Voucher Signal (The "Lead-Lag" Component)
+    VOUCHER_EMA_ALPHA = 0.15
+    VOUCHER_BETA      = 0.8  # Sensitivity of VEV to Voucher moves
 
     def __init__(self):
         super().__init__("VELVETFRUIT_EXTRACT", position_limit=200)
@@ -149,16 +153,31 @@ class VelvetfruitStrategy(Strategy):
         best_ask = min(depth.sell_orders)
         wall_mid = self._get_wall_mid(depth)
 
-        # Initialize mean at first observed price, not 10k
-        # VEV trades around 5,200 so hardcoding 10k would be wrong
+        # 1. Update Long-term Mean
         mean = saved.get("mean", wall_mid)
         mean = self.MEAN_ALPHA * wall_mid + (1 - self.MEAN_ALPHA) * mean
         saved["mean"] = mean
 
+        # 2. Update Short-term EMA (Fair Value)
         fair = saved.get("fair", wall_mid)
         fair = self.EMA_ALPHA * wall_mid + (1 - self.EMA_ALPHA) * fair
+
+        # 3. Incorporate Voucher Lead Signal
+        # We look for price pressure in the vouchers to predict VEV's next move
+        v_depth = state.order_depths.get("VEV_VOUCHER")
+        if v_depth and v_depth.buy_orders and v_depth.sell_orders:
+            v_mid = (max(v_depth.buy_orders) + min(v_depth.sell_orders)) / 2
+            v_ema = saved.get("v_ema", v_mid)
+            v_ema = self.VOUCHER_EMA_ALPHA * v_mid + (1 - self.VOUCHER_EMA_ALPHA) * v_ema
+            saved["v_ema"] = v_ema
+
+            # If Voucher is above its EMA, it suggests upward pressure on the underlying
+            v_diff = v_mid - v_ema
+            fair += (v_diff * self.VOUCHER_BETA)
+        
         saved["fair"] = fair
 
+        # 4. Inventory and Deviation Logic
         skew        = -(position / self.SKEW_DIV)
         skewed_fair = fair + skew
         deviation   = wall_mid - mean
@@ -166,8 +185,10 @@ class VelvetfruitStrategy(Strategy):
         buy_cap  = self.position_limit - position
         sell_cap = self.position_limit + position
 
+        # 5. Market Making Quotes
         our_bid = min(math.floor(skewed_fair) - self.EDGE, best_ask - 1)
         our_ask = max(math.ceil(skewed_fair)  + self.EDGE, best_bid + 1)
+        
         if our_bid >= our_ask:
             our_bid = our_ask - 1
 
@@ -176,16 +197,18 @@ class VelvetfruitStrategy(Strategy):
 
         orders: List[Order] = []
 
-        # Maker — suppress side fighting MR signal
+        # Maker: Suppress one side if we are too far from the long-term mean
         if buy_size > 0 and buy_cap > 0 and deviation < self.MR_THRESH:
             orders.append(self.order(our_bid, buy_size))
         if sell_size > 0 and sell_cap > 0 and deviation > -self.MR_THRESH:
             orders.append(self.order(our_ask, -sell_size))
 
-        # MR taker — only on strong deviations from the rolling mean
+        # Mean Reversion Taker: Only fire on high-confidence deviations
         if deviation < -self.MR_THRESH and buy_cap > 0:
+            # Aggressively lift the ask
             orders.append(self.order(best_ask, min(self.MR_SIZE, buy_cap)))
         elif deviation > self.MR_THRESH and sell_cap > 0:
+            # Aggressively hit the bid
             orders.append(self.order(best_bid, -min(self.MR_SIZE, sell_cap)))
 
         return orders, saved
