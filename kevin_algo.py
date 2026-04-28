@@ -625,16 +625,16 @@ STRATEGIES: Dict[str, Strategy] = {
     # "VEV_6500": VEV_VolArb_Strategy(6500),
 
     # --- OPTIONS: BLACK-SCHOLES MAKER (DYNAMIC IV) ---
-    "VEV_4000": VEV_BS_Strategy(4000),
-    "VEV_4500": VEV_BS_Strategy(4500),
-    "VEV_5000": VEV_BS_Strategy(5000),
-    "VEV_5100": VEV_BS_Strategy(5100),
-    "VEV_5200": VEV_BS_Strategy(5200),
-    "VEV_5300": VEV_BS_Strategy(5300),
-    "VEV_5400": VEV_BS_Strategy(5400),
-    "VEV_5500": VEV_BS_Strategy(5500),
-    "VEV_6000": VEV_BS_Strategy(6000),
-    "VEV_6500": VEV_BS_Strategy(6500),
+    # "VEV_4000": VEV_BS_Strategy(4000),
+    # "VEV_4500": VEV_BS_Strategy(4500),
+    # "VEV_5000": VEV_BS_Strategy(5000),
+    # "VEV_5100": VEV_BS_Strategy(5100),
+    # "VEV_5200": VEV_BS_Strategy(5200),
+    # "VEV_5300": VEV_BS_Strategy(5300),
+    # "VEV_5400": VEV_BS_Strategy(5400),
+    # "VEV_5500": VEV_BS_Strategy(5500),
+    # "VEV_6000": VEV_BS_Strategy(6000),
+    # "VEV_6500": VEV_BS_Strategy(6500),
 }
 
 
