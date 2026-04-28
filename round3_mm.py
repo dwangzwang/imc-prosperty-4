@@ -19,17 +19,21 @@ class Strategy:
 
 
 class HydrogelStrategy(Strategy):
-    WALL_VOL   = 10
-    EMA_ALPHA  = 0.12
-    MEAN_ALPHA = 0.0001
-    SKEW_DIV   = 30
-    MR_THRESH  = 30
-    MR_SIZE    = 20
+    WALL_VOL    = 5      # min size to count as a wall
+    EMA_ALPHA   = 0.18    # fast EMA for fair value
+    MEAN_ALPHA  = 0.0001  # very slow EMA anchored at 10,000
+    SKEW_DIV    = 30      # inventory skew divisor
+    EDGE        = 10       # maker half-spread
+    MM_SIZE     = 30      # base quote size per side
 
-    QUOTE_LEVELS = [
-        (1, 60),
-        (4, 35),
-        (8, 25),
+    MR_THRESH   = 30       # ticks from mean to trigger MR taker
+    MR_SIZE     = 20      # units per MR order
+
+    LADDER_LEVELS = [
+        (20, 15),   # (ticks below/above mean, size)
+        (35, 20),
+        (55, 25),
+        (80, 30),
     ]
 
     def __init__(self):
@@ -59,49 +63,48 @@ class HydrogelStrategy(Strategy):
         best_ask = min(depth.sell_orders)
         wall_mid = self._get_wall_mid(depth)
 
+        # Slow mean anchored at 10,000
         mean = saved.get("mean", 10_000.0)
         mean = self.MEAN_ALPHA * wall_mid + (1 - self.MEAN_ALPHA) * mean
         saved["mean"] = mean
 
+        # Fast EMA fair value
         fair = saved.get("fair", wall_mid)
         fair = self.EMA_ALPHA * wall_mid + (1 - self.EMA_ALPHA) * fair
         saved["fair"] = fair
 
+        # Inventory skew
         skew        = -(position / self.SKEW_DIV)
         skewed_fair = fair + skew
-        deviation   = wall_mid - mean
+
+        our_bid = math.floor(skewed_fair) - self.EDGE
+        our_ask = math.ceil(skewed_fair)  + self.EDGE
+
+        our_bid = min(our_bid, best_ask - 1)
+        our_ask = max(our_ask, best_bid + 1)
+        if our_bid >= our_ask:
+            our_bid = our_ask - 1
 
         buy_cap  = self.position_limit - position
         sell_cap = self.position_limit + position
 
+        buy_size  = min(self.MM_SIZE, int(self.MM_SIZE * (buy_cap  / self.position_limit)))
+        sell_size = min(self.MM_SIZE, int(self.MM_SIZE * (sell_cap / self.position_limit)))
+
+        mr_bias = wall_mid - mean
+
         orders: List[Order] = []
 
-        # ── MULTI-LEVEL MAKER ─────────────────────────────────────────────
-        remaining_buy  = buy_cap
-        remaining_sell = sell_cap
+        # Suppress maker side that fights the MR signal
+        if buy_size > 0 and buy_cap > 0 and mr_bias < self.MR_THRESH:
+            orders.append(self.order(our_bid, buy_size))
+        if sell_size > 0 and sell_cap > 0 and mr_bias > -self.MR_THRESH:
+            orders.append(self.order(our_ask, -sell_size))
 
-        for ticks, size in self.QUOTE_LEVELS:
-            if remaining_buy <= 0 and remaining_sell <= 0:
-                break
+    
 
-            buy_size  = min(size, remaining_buy)
-            sell_size = min(size, remaining_sell)
-
-            bid_price = min(math.floor(skewed_fair) - ticks, best_ask - 1)
-            ask_price = max(math.ceil(skewed_fair)  + ticks, best_bid + 1)
-
-            if bid_price >= ask_price:
-                bid_price = ask_price - 1
-
-            if buy_size > 0 and deviation < self.MR_THRESH:
-                orders.append(self.order(bid_price, buy_size))
-                remaining_buy -= buy_size
-
-            if sell_size > 0 and deviation > -self.MR_THRESH:
-                orders.append(self.order(ask_price, -sell_size))
-                remaining_sell -= sell_size
-
-        # ── MR TAKER ─────────────────────────────────────────────────────
+        # MR taker
+        deviation = wall_mid - mean
         if deviation < -self.MR_THRESH and buy_cap > 0:
             orders.append(self.order(best_ask, min(self.MR_SIZE, buy_cap)))
         elif deviation > self.MR_THRESH and sell_cap > 0:
@@ -110,17 +113,14 @@ class HydrogelStrategy(Strategy):
         return orders, saved
 
 class VelvetfruitStrategy(Strategy):
-    """
-    EMA + cost-basis market maker for VELVETFRUIT_EXTRACT.
-    Same cost-basis logic as Hydrogel.
-    """
-    WALL_VOL     = 10
-    EMA_ALPHA    = 0.15
-    SKEW_DIV     = 50
-    EDGE         = 1
-    MM_SIZE      = 20
-    MIN_PROFIT   = 1
-    COST_WEIGHT  = 0.3
+    WALL_VOL   = 10
+    EMA_ALPHA  = 0.12
+    MEAN_ALPHA = 0.0001  # anchored at first tick price, not 10k
+    SKEW_DIV   = 50
+    EDGE       = 1
+    MM_SIZE    = 30
+    MR_THRESH  = 30
+    MR_SIZE    = 20
 
     def __init__(self):
         super().__init__("VELVETFRUIT_EXTRACT", position_limit=200)
@@ -138,47 +138,8 @@ class VelvetfruitStrategy(Strategy):
                 break
         return (valid_bid + valid_ask) / 2
 
-    def _update_cost_basis(self, state: TradingState, saved: dict) -> float:
-        """Track average cost of current position via own_trades."""
-        total_cost = saved.get("total_cost", 0.0)
-        total_qty  = saved.get("total_qty", 0)
-
-        trades = state.own_trades.get(self.product, [])
-        for trade in trades:
-            fill_qty   = trade.quantity
-            fill_price = trade.price
-
-            if total_qty == 0:
-                total_cost = fill_price * abs(fill_qty)
-                total_qty  = fill_qty
-            elif (total_qty > 0 and fill_qty > 0) or (total_qty < 0 and fill_qty < 0):
-                total_cost += fill_price * abs(fill_qty)
-                total_qty  += fill_qty
-            else:
-                close_qty = min(abs(fill_qty), abs(total_qty))
-                remaining_fill = abs(fill_qty) - close_qty
-
-                if abs(fill_qty) >= abs(total_qty):
-                    if remaining_fill > 0:
-                        total_cost = fill_price * remaining_fill
-                        total_qty  = fill_qty + total_qty
-                    else:
-                        total_cost = 0.0
-                        total_qty  = 0
-                else:
-                    avg = total_cost / abs(total_qty) if total_qty != 0 else fill_price
-                    total_qty  += fill_qty
-                    total_cost = avg * abs(total_qty)
-
-        saved["total_cost"] = total_cost
-        saved["total_qty"]  = total_qty
-
-        if total_qty != 0:
-            return total_cost / abs(total_qty)
-        return None
-
     def get_orders(self, state: TradingState, saved: dict) -> Tuple[List[Order], dict]:
-        depth = state.order_depths[self.product]
+        depth    = state.order_depths[self.product]
         position = state.position.get(self.product, 0)
 
         if not depth.buy_orders or not depth.sell_orders:
@@ -186,57 +147,53 @@ class VelvetfruitStrategy(Strategy):
 
         best_bid = max(depth.buy_orders)
         best_ask = min(depth.sell_orders)
-
         wall_mid = self._get_wall_mid(depth)
+
+        # Initialize mean at first observed price, not 10k
+        # VEV trades around 5,200 so hardcoding 10k would be wrong
+        mean = saved.get("mean", wall_mid)
+        mean = self.MEAN_ALPHA * wall_mid + (1 - self.MEAN_ALPHA) * mean
+        saved["mean"] = mean
+
         fair = saved.get("fair", wall_mid)
         fair = self.EMA_ALPHA * wall_mid + (1 - self.EMA_ALPHA) * fair
         saved["fair"] = fair
 
-        cost_basis = self._update_cost_basis(state, saved)
-
-        if cost_basis is not None and position != 0:
-            blended_fair = (1 - self.COST_WEIGHT) * fair + self.COST_WEIGHT * cost_basis
-        else:
-            blended_fair = fair
-
-        skew = -(position / self.SKEW_DIV)
-        skewed_fair = blended_fair + skew
-
-        our_bid = math.floor(skewed_fair) - self.EDGE
-        our_ask = math.ceil(skewed_fair)  + self.EDGE
-
-        # profit floor
-        if cost_basis is not None:
-            if position > 0:
-                our_ask = max(our_ask, math.ceil(cost_basis + self.MIN_PROFIT))
-            elif position < 0:
-                our_bid = min(our_bid, math.floor(cost_basis - self.MIN_PROFIT))
-
-        our_bid = min(our_bid, best_ask - 1)
-        our_ask = max(our_ask, best_bid + 1)
-
-        if our_bid >= our_ask:
-            our_bid = our_ask - 1
+        skew        = -(position / self.SKEW_DIV)
+        skewed_fair = fair + skew
+        deviation   = wall_mid - mean
 
         buy_cap  = self.position_limit - position
         sell_cap = self.position_limit + position
+
+        our_bid = min(math.floor(skewed_fair) - self.EDGE, best_ask - 1)
+        our_ask = max(math.ceil(skewed_fair)  + self.EDGE, best_bid + 1)
+        if our_bid >= our_ask:
+            our_bid = our_ask - 1
 
         buy_size  = min(self.MM_SIZE, int(self.MM_SIZE * (buy_cap  / self.position_limit)))
         sell_size = min(self.MM_SIZE, int(self.MM_SIZE * (sell_cap / self.position_limit)))
 
         orders: List[Order] = []
-        if buy_size > 0 and buy_cap > 0:
+
+        # Maker — suppress side fighting MR signal
+        if buy_size > 0 and buy_cap > 0 and deviation < self.MR_THRESH:
             orders.append(self.order(our_bid, buy_size))
-        if sell_size > 0 and sell_cap > 0:
+        if sell_size > 0 and sell_cap > 0 and deviation > -self.MR_THRESH:
             orders.append(self.order(our_ask, -sell_size))
 
+        # MR taker — only on strong deviations from the rolling mean
+        if deviation < -self.MR_THRESH and buy_cap > 0:
+            orders.append(self.order(best_ask, min(self.MR_SIZE, buy_cap)))
+        elif deviation > self.MR_THRESH and sell_cap > 0:
+            orders.append(self.order(best_bid, -min(self.MR_SIZE, sell_cap)))
+
         return orders, saved
-
-
+    
 # registry
 STRATEGIES: Dict[str, Strategy] = {
     "HYDROGEL_PACK": HydrogelStrategy(),
-    # "VELVETFRUIT_EXTRACT": VelvetfruitStrategy(),
+    "VELVETFRUIT_EXTRACT": VelvetfruitStrategy(),
 }
 
 
