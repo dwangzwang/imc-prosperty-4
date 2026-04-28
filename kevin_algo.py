@@ -249,37 +249,33 @@ class OsmiumStrategy(Strategy):
         return orders, {}
 
 class HydrogelStrategy(Strategy):
-    WALL_VOL     = 10       # min size to count as a wall
-    SMOOTH_A     = 0.15    # EMA alpha for fair value smoothing
-    ROLLING_WINDOW = 45_000
-    DOWNSAMPLE   = 4         # max timesteps for pseudo-rolling mean (circular buffer — O(1) writes)
-    ARB_THRESH   = 7       # Ticks away from true value before anchor kicks in
-    SKEW_DIVISOR = 50      # Higher divisor = weaker skew, allows more volume buildup
-    EDGE         = 1       # Min edge from skewed fair value
-    MM_SIZE      = 20      # base quote size
+    WALL_VOL    = 5      # min size to count as a wall
+    EMA_ALPHA   = 0.18    # fast EMA for fair value
+    MEAN_ALPHA  = 0.0001  # very slow EMA anchored at 10,000
+    SKEW_DIV    = 30      # inventory skew divisor
+    EDGE        = 10       # maker half-spread
+    MM_SIZE     = 30      # base quote size per side
+    MR_THRESH   = 30       # ticks from mean to trigger MR taker
+    MR_SIZE     = 20      # units per MR order
 
     def __init__(self):
         super().__init__("HYDROGEL_PACK", position_limit=200)
 
     def _get_wall_mid(self, depth: OrderDepth) -> float:
-        # Walk from best bid inward until we hit a wall
         valid_bid = max(depth.buy_orders.keys())
         for bid in sorted(depth.buy_orders.keys(), reverse=True):
             if depth.buy_orders[bid] >= self.WALL_VOL:
                 valid_bid = bid
                 break
-
-        # Walk from best ask inward until we hit a wall
         valid_ask = min(depth.sell_orders.keys())
         for ask in sorted(depth.sell_orders.keys()):
             if abs(depth.sell_orders[ask]) >= self.WALL_VOL:
                 valid_ask = ask
                 break
-
         return (valid_bid + valid_ask) / 2
 
-    def get_orders(self, state: TradingState, saved: dict):
-        depth = state.order_depths[self.product]
+    def get_orders(self, state: TradingState, saved: dict) -> Tuple[List[Order], dict]:
+        depth    = state.order_depths[self.product]
         position = state.position.get(self.product, 0)
 
         if not depth.buy_orders or not depth.sell_orders:
@@ -287,99 +283,78 @@ class HydrogelStrategy(Strategy):
 
         best_bid = max(depth.buy_orders)
         best_ask = min(depth.sell_orders)
-
-        # --- WALL MID ---
         wall_mid = self._get_wall_mid(depth)
 
-        # --- SMOOTHED FAIR VALUE (EMA via traderdata) ---
+        # Slow mean anchored at 10,000
+        mean = saved.get("mean", 10_000.0)
+        mean = self.MEAN_ALPHA * wall_mid + (1 - self.MEAN_ALPHA) * mean
+        saved["mean"] = mean
+
+        # Fast EMA fair value
         fair = saved.get("fair", wall_mid)
-        fair = self.SMOOTH_A * wall_mid + (1 - self.SMOOTH_A) * fair
+        fair = self.EMA_ALPHA * wall_mid + (1 - self.EMA_ALPHA) * fair
         saved["fair"] = fair
 
-        # --- DYNAMIC TRUE VALUE ANCHOR (Robust Mean Reversion) ---
-        # Instead of hardcoding 10,000, we maintain a very slow EMA (alpha=0.001).
-        # We initialize it at 10,000. If the actual simulation day is abnormally low 
-        # (e.g. centered around 9980), the slow EMA gracefully drifts down to 9980,
-        # preventing us from getting stuck continuously buying a "dip" that is actually the new normal.
-        prices    = saved.get("prices", [])
-        ptr       = saved.get("ptr", 0)
-        tick_buf  = saved.get("tick_buf", [])
-        tick_buf.append(wall_mid)
-        if len(tick_buf) == self.DOWNSAMPLE:
-            if len(prices) < self.ROLLING_WINDOW:
-                prices.append(sum(tick_buf) / self.DOWNSAMPLE)
-            else:
-                prices[ptr] = sum(tick_buf) / self.DOWNSAMPLE
-            ptr = (ptr + 1) % self.ROLLING_WINDOW
-            tick_buf = []
-        true_value = sum(prices) / len(prices) if prices else wall_mid
-        saved["prices"]   = prices
-        saved["ptr"]      = ptr
-        saved["tick_buf"] = tick_buf
-
-        diff = fair - true_value
-        if diff > self.ARB_THRESH:
-            fair -= (diff - self.ARB_THRESH)
-        elif diff < -self.ARB_THRESH:
-            fair -= (diff + self.ARB_THRESH)
-
-        # --- INVENTORY SKEW ---
-        # We previously used a cubic skew which was too "flat" in the middle. 
-        # A strong linear skew actively shifts our pricing down as we get long, and up as we get short.
-        # We use a divisor of 40. At max position (200), skew is -5 ticks.
-        # This provides plenty of room to build up an inventory before we drastically panic our quotes.
-        skew = -(position / self.SKEW_DIVISOR)
-
+        # Inventory skew
+        skew        = -(position / self.SKEW_DIV)
         skewed_fair = fair + skew
-        
-        # A static edge creates a tighter spread to ensure we are actually capturing trade volume.
-        # Combined with the linear skew, we remain perfectly safe while actively market making.
+
         our_bid = math.floor(skewed_fair) - self.EDGE
         our_ask = math.ceil(skewed_fair)  + self.EDGE
 
-        # --- PURE MAKER LOGIC ---
-        # Allow our quotes to improve the spread, but strictly cap them to not cross the existing market.
-        # We never take liquidity (pay the spread); we only provide it (earn the spread).
         our_bid = min(our_bid, best_ask - 1)
         our_ask = max(our_ask, best_bid + 1)
-        
         if our_bid >= our_ask:
             our_bid = our_ask - 1
 
-        # Shrink quote size as we approach the limit 
-        buy_cap  = self.position_limit - position   
-        sell_cap = self.position_limit + position   
-        
+        buy_cap  = self.position_limit - position
+        sell_cap = self.position_limit + position
+
         buy_size  = min(self.MM_SIZE, int(self.MM_SIZE * (buy_cap  / self.position_limit)))
         sell_size = min(self.MM_SIZE, int(self.MM_SIZE * (sell_cap / self.position_limit)))
 
+        mr_bias = wall_mid - mean
+
         orders: List[Order] = []
-        if buy_size > 0 and buy_cap > 0:
-            orders.append(self.order(our_bid, buy_size))
-        if sell_size > 0 and sell_cap > 0:
-            orders.append(self.order(our_ask, -sell_size))
+
+        # Suppress maker side that fights the MR signal
+        if buy_size > 0 and buy_cap > 0 and mr_bias < self.MR_THRESH:
+            orders.append(self.order(our_bid, buy_size/2))
+            orders.append(self.order(our_bid, buy_size/2))
+        if sell_size > 0 and sell_cap > 0 and mr_bias > -self.MR_THRESH:
+            orders.append(self.order(our_ask, -sell_size/2))
+            orders.append(self.order(our_ask, -sell_size/2))
+
+    
+
+        # MR taker
+        deviation = wall_mid - mean
+
+        if deviation < -self.MR_THRESH and buy_cap > 0:
+            orders.append(self.order(best_ask, min(self.MR_SIZE, buy_cap)/2))
+            orders.append(self.order(best_ask, min(self.MR_SIZE, buy_cap)/2))
+        elif deviation > self.MR_THRESH and sell_cap > 0:
+            orders.append(self.order(best_bid, -min(self.MR_SIZE, sell_cap)/2))
+            orders.append(self.order(best_bid, -min(self.MR_SIZE, sell_cap)/2))
 
         return orders, saved
 
-# VELVETFRUIT_EXTRACT: Pure MM (no true value anchor)
-#
-# Velvetfruit drifts slowly (+6, +20, +28 per day — inconsistent)
-# and mean-reverts around the drift (AC1=-0.16). We don't try to
-# predict direction — just MM around the market mid.
-#
-# Like Hydrogel, uses jump detection and inventory skew for defense.
-# NO EMA smoothing because a genuine drift would leave us lagging behind
-# and executing losing orders.
-
 class VelvetfruitStrategy(Strategy):
-    WALL_VOL     = 10       # min size to count as a wall
-    SMOOTH_A     = 0.15     # EMA alpha for fair value smoothing
-    ROLLING_WINDOW = 80_000
-    DOWNSAMPLE   = 2         # shorter window than Hydrogel — Velvetfruit drifts faster, so we track tighter (circular buffer — O(1) writes)
-    ARB_THRESH   = 3        # Tighter threshold given Velvetfruit's lower std dev (15 vs 32)
-    SKEW_DIVISOR = 50       # Higher divisor = weaker skew, allows more volume buildup
-    EDGE         = 1        # Min edge from skewed fair value
-    MM_SIZE      = 20       # base quote size
+    # Market Making & Smoothing
+    WALL_VOL   = 10
+    EMA_ALPHA  = 0.12
+    MEAN_ALPHA = 0.0001 
+    SKEW_DIV   = 50
+    EDGE       = 1
+    MM_SIZE    = 30
+
+    # Mean Reversion
+    MR_THRESH  = 30
+    MR_SIZE    = 20
+
+    # Voucher Signal (The "Lead-Lag" Component)
+    VOUCHER_EMA_ALPHA = 0.15
+    VOUCHER_BETA      = 0.8  # Sensitivity of VEV to Voucher moves
 
     def __init__(self):
         super().__init__("VELVETFRUIT_EXTRACT", position_limit=200)
@@ -398,7 +373,7 @@ class VelvetfruitStrategy(Strategy):
         return (valid_bid + valid_ask) / 2
 
     def get_orders(self, state: TradingState, saved: dict) -> Tuple[List[Order], dict]:
-        depth = state.order_depths[self.product]
+        depth    = state.order_depths[self.product]
         position = state.position.get(self.product, 0)
 
         if not depth.buy_orders or not depth.sell_orders:
@@ -406,259 +381,311 @@ class VelvetfruitStrategy(Strategy):
 
         best_bid = max(depth.buy_orders)
         best_ask = min(depth.sell_orders)
-
-        # --- WALL MID ---
         wall_mid = self._get_wall_mid(depth)
 
-        # --- SMOOTHED FAIR VALUE (EMA via traderdata) ---
+        # 1. Update Long-term Mean
+        mean = saved.get("mean", wall_mid)
+        mean = self.MEAN_ALPHA * wall_mid + (1 - self.MEAN_ALPHA) * mean
+        saved["mean"] = mean
+
+        # 2. Update Short-term EMA (Fair Value)
         fair = saved.get("fair", wall_mid)
-        fair = self.SMOOTH_A * wall_mid + (1 - self.SMOOTH_A) * fair
+        fair = self.EMA_ALPHA * wall_mid + (1 - self.EMA_ALPHA) * fair
+
+        # 3. Incorporate Voucher Lead Signal
+        # We look for price pressure in the vouchers to predict VEV's next move
+        v_depth = state.order_depths.get("VEV_VOUCHER")
+        if v_depth and v_depth.buy_orders and v_depth.sell_orders:
+            v_mid = (max(v_depth.buy_orders) + min(v_depth.sell_orders)) / 2
+            v_ema = saved.get("v_ema", v_mid)
+            v_ema = self.VOUCHER_EMA_ALPHA * v_mid + (1 - self.VOUCHER_EMA_ALPHA) * v_ema
+            saved["v_ema"] = v_ema
+
+            # If Voucher is above its EMA, it suggests upward pressure on the underlying
+            v_diff = v_mid - v_ema
+            fair += (v_diff * self.VOUCHER_BETA)
+        
         saved["fair"] = fair
 
-        # --- DYNAMIC TRUE VALUE ANCHOR (Robust Mean Reversion) ---
-        # Absorbs the slow linear drift of Velvetfruit. 
-        # Initializes at the first tick's mid-price so it perfectly traces the day's baseline.
-        prices    = saved.get("prices", [])
-        ptr       = saved.get("ptr", 0)
-        tick_buf  = saved.get("tick_buf", [])
-        tick_buf.append(wall_mid)
-        if len(tick_buf) == self.DOWNSAMPLE:
-            if len(prices) < self.ROLLING_WINDOW:
-                prices.append(sum(tick_buf) / self.DOWNSAMPLE)
-            else:
-                prices[ptr] = sum(tick_buf) / self.DOWNSAMPLE
-            ptr = (ptr + 1) % self.ROLLING_WINDOW
-            tick_buf = []
-        true_value = sum(prices) / len(prices) if prices else wall_mid
-        saved["prices"]   = prices
-        saved["ptr"]      = ptr
-        saved["tick_buf"] = tick_buf
-
-        diff = fair - true_value
-        if diff > self.ARB_THRESH:
-            fair -= (diff - self.ARB_THRESH)
-        elif diff < -self.ARB_THRESH:
-            fair -= (diff + self.ARB_THRESH)
-
-        # --- INVENTORY SKEW ---
-        # A strong linear skew actively shifts our pricing down as we get long, and up as we get short.
-        skew = -(position / self.SKEW_DIVISOR)
-
+        # 4. Inventory and Deviation Logic
+        skew        = -(position / self.SKEW_DIV)
         skewed_fair = fair + skew
-        
-        # A static edge creates a tighter spread to ensure we are actually capturing trade volume.
-        our_bid = math.floor(skewed_fair) - self.EDGE
-        our_ask = math.ceil(skewed_fair)  + self.EDGE
+        deviation   = wall_mid - mean
 
-        # --- PURE MAKER LOGIC ---
-        our_bid = min(our_bid, best_ask - 1)
-        our_ask = max(our_ask, best_bid + 1)
+        buy_cap  = self.position_limit - position
+        sell_cap = self.position_limit + position
+
+        # 5. Market Making Quotes
+        our_bid = min(math.floor(skewed_fair) - self.EDGE, best_ask - 1)
+        our_ask = max(math.ceil(skewed_fair)  + self.EDGE, best_bid + 1)
         
         if our_bid >= our_ask:
             our_bid = our_ask - 1
 
-        # Shrink quote size as we approach the limit 
-        buy_cap  = self.position_limit - position   
-        sell_cap = self.position_limit + position   
-        
         buy_size  = min(self.MM_SIZE, int(self.MM_SIZE * (buy_cap  / self.position_limit)))
         sell_size = min(self.MM_SIZE, int(self.MM_SIZE * (sell_cap / self.position_limit)))
 
         orders: List[Order] = []
-        if buy_size > 0 and buy_cap > 0:
+
+        # Maker: Suppress one side if we are too far from the long-term mean
+        if buy_size > 0 and buy_cap > 0 and deviation < self.MR_THRESH:
             orders.append(self.order(our_bid, buy_size))
-        if sell_size > 0 and sell_cap > 0:
+        if sell_size > 0 and sell_cap > 0 and deviation > -self.MR_THRESH:
             orders.append(self.order(our_ask, -sell_size))
+
+        # Mean Reversion Taker: Only fire on high-confidence deviations
+        if deviation < -self.MR_THRESH and buy_cap > 0:
+            # Aggressively lift the ask
+            orders.append(self.order(best_ask, min(self.MR_SIZE, buy_cap)))
+        elif deviation > self.MR_THRESH and sell_cap > 0:
+            # Aggressively hit the bid
+            orders.append(self.order(best_bid, -min(self.MR_SIZE, sell_cap)))
 
         return orders, saved
 
-def bs_fair(S, K, T, iv):
-    if T <= 1e-8 or iv <= 0: return max(0.0, S - K)
-    d1 = (math.log(S/K) + 0.5*iv*iv*T) / (iv*math.sqrt(T))
-    d2 = d1 - iv*math.sqrt(T)
-    return S*norm_cdf(d1) - K*norm_cdf(d2)
-
-def fit_iv(mid, S, K, T):
-    intrinsic = max(0.0, S - K)
-    if mid - intrinsic < 0.5 or T < 1e-8: return None
-    iv = math.sqrt(2*math.pi/T) * (mid - intrinsic) / S
-    iv = max(0.01, min(2.0, iv))
-    for _ in range(30):
-        d1 = (math.log(S/K) + 0.5*iv*iv*T) / (iv*math.sqrt(T))
-        d2 = d1 - iv*math.sqrt(T)
-        p  = S*norm_cdf(d1) - K*norm_cdf(d2)
-        v  = S*math.sqrt(T)*norm_pdf(d1)
-        if v < 1e-10: break
-        iv -= (p - mid) / v
-        iv  = max(0.01, min(2.0, iv))
-        if abs(p - mid) < 0.01: return iv
-    return iv if 0.01 < iv < 2.0 else None
-
-
+# options trading bs
 class VEV_Strategy(Strategy):
-    TOTAL_LIFE  = 8
-    CURRENT_DAY = 4
+    """
+    Enhanced multi-signal options strategy – RISKY version.
+    Same algorithm structure, but more aggressive parameters:
+    - Lower thresholds for entry
+    - Larger position limits and sizes
+    - Wider stops, higher take-profit targets
+    - Stronger momentum and vertical signal boosts
+    """
+    # Imbalance parameters – lower threshold = more trades
+    IMB_TH_BASE = 0.12          # Was 0.18 – more sensitive
+    IMB_EMA = 0.2               # Slightly faster reaction
 
-    # Phase 1: Silent observation. Build IV and measure dislocation.
-    OBSERVE_TS  = 8_000
+    # Vertical spread parameters – lower threshold = more relative value trades
+    VERTICAL_SIZE = 5
+    VERTICAL_THRESH = 3.0       # Was 4.0 – easier to trigger
 
-    # Phase 2: Enter full position fading the dislocation.
-    # Only enter if dislocation exceeds MIN_EDGE ticks — below this it's noise.
-    MIN_EDGE    = 3.0
+    # Momentum and risk – more aggressive
+    MOMENTUM_WINDOW = 2         # Shorter = faster reaction
+    MAX_POSITION = 240          # Was 180 – let positions run larger
+    STOP_LOSS_PCT = 0.12        # Was 0.08 – wider stop, less cutting
+    TAKE_PROFIT_PCT = 0.18      # Was 0.12 – let winners run
+    VOL_HIGH_THRESH = 0.45      # Was 0.35 – less penalty for volatility
+    MAX_TS = 90000
 
-    # Phase 3: Hold until price converges within TAKE_PROFIT ticks of fair,
-    # OR until STOP_LOSS ticks move against us — then exit entirely.
-    TAKE_PROFIT = 2.0
-    STOP_LOSS   = 8.0
+    # Size parameters – LARGER POSITIONS (modified)
+    BASE_SIZE = 15              # Was 8 – much larger per tick
+    MAX_SIZE = 60               # Was 30 – much larger cap
 
-    # Phase 4: Hard flatten everything at DUMP_TS regardless.
-    DUMP_TS     = 82_000
-
-    # Staggered exit: once take-profit hit, unwind over UNWIND_TICKS ticks
-    # to avoid slamming the market with 300 lots at once.
-    UNWIND_TICKS = 5
-
-    IV_ALPHA    = 0.50    # Hot during observation — converge fast
-
-    def __init__(self, strike):
+    def __init__(self, strike: int):
         super().__init__(f"VEV_{strike}", position_limit=300)
-        self.K = strike
+        self.strike = strike
 
-    def _T(self, ts):
-        return max(1e-6, ((self.TOTAL_LIFE - self.CURRENT_DAY) - ts/1_000_000) / self.TOTAL_LIFE)
+    def _get_underlying_data(self, state: TradingState, saved: dict):
+        under_depth = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        if not under_depth or not under_depth.buy_orders or not under_depth.sell_orders:
+            return None, None, 0.0
+        best_bid = max(under_depth.buy_orders)
+        best_ask = min(under_depth.sell_orders)
+        under_mid = (best_bid + best_ask) / 2.0
 
-    def get_orders(self, state, saved):
-        vf = state.order_depths.get("VELVETFRUIT_EXTRACT")
-        if not vf or not vf.buy_orders or not vf.sell_orders:
-            return [], saved
-        S = (max(vf.buy_orders) + min(vf.sell_orders)) / 2
+        prices = saved.get("under_prices", [])
+        prices.append(under_mid)
+        if len(prices) > self.MOMENTUM_WINDOW + 1:
+            prices = prices[-(self.MOMENTUM_WINDOW + 1):]
+        saved["under_prices"] = prices
 
+        momentum = 0.0
+        volatility = 0.0
+        if len(prices) >= 2:
+            momentum = (prices[-1] - prices[-2]) / prices[-2]
+        if len(prices) >= 3:
+            max_p = max(prices)
+            min_p = min(prices)
+            volatility = (max_p - min_p) / min_p if min_p > 0 else 0.0
+        return under_mid, momentum, volatility
+
+    def _get_adjacent_strikes_mids(self, state: TradingState):
+        all_mids = {}
+        for prod in state.order_depths:
+            if prod.startswith("VEV_"):
+                depth = state.order_depths[prod]
+                if depth.buy_orders and depth.sell_orders:
+                    best_bid = max(depth.buy_orders)
+                    best_ask = min(depth.sell_orders)
+                    all_mids[int(prod.split("_")[1])] = (best_bid + best_ask) / 2.0
+        return all_mids
+
+    def _vertical_spread_signal(self, state: TradingState, current_mid: float) -> int:
+        all_mids = self._get_adjacent_strikes_mids(state)
+        if self.strike not in all_mids:
+            return 0
+        strikes = sorted(all_mids.keys())
+        idx = strikes.index(self.strike)
+        signals = []
+
+        if idx > 0:
+            K_low = strikes[idx-1]
+            spread_market = all_mids[self.strike] - all_mids[K_low]
+            fair_spread = max(0, self.strike - K_low)
+            mispricing = spread_market - fair_spread
+            if mispricing > self.VERTICAL_THRESH:
+                signals.append(-1)
+            elif mispricing < -self.VERTICAL_THRESH:
+                signals.append(1)
+
+        if idx + 1 < len(strikes):
+            K_high = strikes[idx+1]
+            spread_market = all_mids[K_high] - all_mids[self.strike]
+            fair_spread = max(0, K_high - self.strike)
+            mispricing = spread_market - fair_spread
+            if mispricing > self.VERTICAL_THRESH:
+                signals.append(1)
+            elif mispricing < -self.VERTICAL_THRESH:
+                signals.append(-1)
+
+        if not signals:
+            return 0
+        total = sum(signals)
+        return 1 if total > 0 else (-1 if total < 0 else 0)
+
+    def get_orders(self, state: TradingState, saved: dict):
         depth = state.order_depths.get(self.product)
         if not depth or not depth.buy_orders or not depth.sell_orders:
             return [], saved
 
         best_bid = max(depth.buy_orders)
         best_ask = min(depth.sell_orders)
-        mid      = (best_bid + best_ask) / 2
+        spread = best_ask - best_bid
+        mid = (best_bid + best_ask) / 2.0
         position = state.position.get(self.product, 0)
-        ts       = state.timestamp
-        T        = self._T(ts)
-        buy_cap  = self.position_limit - position
+        ts = state.timestamp
+
+        buy_cap = self.position_limit - position
         sell_cap = self.position_limit + position
-        orders   = []
+        orders = []
 
-        # Always update IV during observation phase
-        iv      = saved.get("iv", None)
-        iv_obs  = saved.get("iv_obs", 0)
-        live_iv = fit_iv(mid, S, self.K, T)
-        if live_iv is not None:
-            iv     = live_iv if iv is None else self.IV_ALPHA*live_iv + (1-self.IV_ALPHA)*iv
-            iv_obs += 1
-        saved["iv"]     = iv
-        saved["iv_obs"] = iv_obs
+        # Order book imbalance
+        bid_vol = sum(depth.buy_orders.values())
+        ask_vol = sum(abs(v) for v in depth.sell_orders.values())
+        total = bid_vol + ask_vol
+        if total == 0:
+            raw_imb = 0.0
+        else:
+            raw_imb = (bid_vol - ask_vol) / total
+        prev_imb = saved.get("smooth_imb", raw_imb)
+        smooth_imb = self.IMB_EMA * raw_imb + (1 - self.IMB_EMA) * prev_imb
+        saved["smooth_imb"] = smooth_imb
 
-        # ══ PHASE 1: OBSERVE — do nothing, just build IV ═════════════════
-        if ts < self.OBSERVE_TS or iv is None or iv_obs < 4:
-            return [], saved
+        # Underlying momentum & volatility filter
+        under_mid, momentum, volatility = self._get_underlying_data(state, saved)
+        momentum_boost = 1.0
+        vol_penalty = 1.0
+        if under_mid is not None and momentum is not None:
+            if (smooth_imb > 0 and momentum > 0) or (smooth_imb < 0 and momentum < 0):
+                momentum_boost = 1.6      # Was 1.4 – stronger boost
+            elif (smooth_imb > 0 and momentum < -0.0005) or (smooth_imb < 0 and momentum > 0.0005):
+                momentum_boost = 0.6      # Was 0.5 – less penalty
+            if volatility > self.VOL_HIGH_THRESH:
+                vol_penalty = 0.8         # Was 0.6 – less reduction
 
-        fair = bs_fair(S, self.K, T, iv)
+        # Vertical spread signal
+        vert_signal = self._vertical_spread_signal(state, mid)
 
-        # ══ PHASE 4: HARD DUMP ═══════════════════════════════════════════
-        if ts >= self.DUMP_TS:
-            if position > 0:
-                r = position
-                for bid in sorted(depth.buy_orders, reverse=True):
-                    if r <= 0: break
-                    q = min(r, depth.buy_orders[bid])
-                    orders.append(self.order(bid, -q))
-                    r -= q
-                if r > 0: orders.append(self.order(best_bid, -r))
-            elif position < 0:
-                r = -position
-                for ask in sorted(depth.sell_orders):
-                    if r <= 0: break
-                    q = min(r, abs(depth.sell_orders[ask]))
-                    orders.append(self.order(ask, q))
-                    r -= q
-                if r > 0: orders.append(self.order(best_ask, r))
-            saved["phase"] = "done"
+        # Combine signals
+        combined = smooth_imb * momentum_boost * vol_penalty
+        if vert_signal != 0:
+            if (vert_signal > 0 and combined > 0) or (vert_signal < 0 and combined < 0):
+                combined *= 1.4           # Was 1.25 – stronger reinforcement
+            else:
+                combined *= 0.8           # Was 0.7 – less conflict penalty
+
+        # Adaptive threshold
+        dynamic_th = self.IMB_TH_BASE * (0.7 if vert_signal != 0 else 1.0)
+
+        # Dead zone / market making (larger mm size)
+        if abs(combined) < dynamic_th:
+            if spread >= 2:
+                mm_size = min(10, buy_cap, sell_cap)   # Was 5 – larger market making
+                if buy_cap > 0:
+                    orders.append(self.order(best_bid + 1, mm_size))
+                if sell_cap > 0:
+                    orders.append(self.order(best_ask - 1, -mm_size))
             return orders, saved
 
-        phase      = saved.get("phase", "seek")
-        entry_fair = saved.get("entry_fair", None)
-        direction  = saved.get("direction", 0)
+        # Signal trading with aggressive sizing (now BASE_SIZE and MAX_SIZE are larger)
+        size = self.BASE_SIZE
+        size += int(spread * 2)             # Was 1.5 – more sensitive to spread
+        size += int(abs(combined) * 20)     # Was 15 – larger from strong signals
+        if vert_signal != 0:
+            size += 3                       # Was 2
+        size = int(size * vol_penalty)
+        size = min(self.MAX_SIZE, max(4, size))  # Minimum 4 (was 3)
 
-        # ══ PHASE 2: SEEK — find and enter the dislocation ═══════════════
-        if phase == "seek":
-            dislocation = mid - fair
+        if combined > dynamic_th and buy_cap > 0:
+            orders.append(self.order(best_ask, min(size, buy_cap)))
+        elif combined < -dynamic_th and sell_cap > 0:
+            orders.append(self.order(best_bid, -min(size, sell_cap)))
 
-            if dislocation > self.MIN_EDGE and sell_cap > 0:
-                # Market is RICH vs fair → short it, expect price to fall
-                for bid in sorted(depth.buy_orders, reverse=True):
-                    if sell_cap <= 0: break
-                    q = min(sell_cap, depth.buy_orders[bid])
-                    orders.append(self.order(bid, -q))
-                    sell_cap -= q
-                # Post ask to fill remaining capacity
-                if sell_cap > 0:
-                    orders.append(self.order(best_bid, -sell_cap))
-                saved["phase"]      = "hold"
-                saved["direction"]  = -1
-                saved["entry_fair"] = fair
-                saved["entry_mid"]  = mid
-
-            elif dislocation < -self.MIN_EDGE and buy_cap > 0:
-                # Market is CHEAP vs fair → long it, expect price to rise
-                for ask in sorted(depth.sell_orders):
-                    if buy_cap <= 0: break
-                    q = min(buy_cap, abs(depth.sell_orders[ask]))
-                    orders.append(self.order(ask, q))
-                    buy_cap -= q
-                if buy_cap > 0:
-                    orders.append(self.order(best_ask, buy_cap))
-                saved["phase"]      = "hold"
-                saved["direction"]  = 1
-                saved["entry_fair"] = fair
-                saved["entry_mid"]  = mid
-
-        # ══ PHASE 3: HOLD — wait for convergence or stop loss ════════════
-        elif phase == "hold":
-            entry_mid = saved.get("entry_mid", fair)
-            pnl_ticks = direction * (mid - entry_mid)
-
-            hit_tp = (mid - fair) * direction < self.TAKE_PROFIT  and pnl_ticks > 0
-            hit_sl = pnl_ticks < -self.STOP_LOSS
-
-            if hit_tp or hit_sl:
-                # Exit entire position
+        # Position management: slower reduction (more risk)
+        if position != 0 and under_mid is not None:
+            if "entry_price" not in saved and abs(position) > 0:
+                saved["entry_price"] = mid
+                saved["entry_pos"] = position
+            entry = saved.get("entry_price")
+            if entry:
                 if position > 0:
-                    r = position
-                    for bid in sorted(depth.buy_orders, reverse=True):
-                        if r <= 0: break
-                        q = min(r, depth.buy_orders[bid])
-                        orders.append(self.order(bid, -q))
-                        r -= q
-                    if r > 0: orders.append(self.order(best_bid, -r))
+                    pnl_pct = (mid - entry) / entry
+                    if pnl_pct < -self.STOP_LOSS_PCT:
+                        # Stop loss: reduce only 1/3 (was 1/2) – less aggressive cutting
+                        reduce = min(position // 3, sell_cap)
+                        if reduce > 0:
+                            orders.append(self.order(best_bid, -reduce))
+                            if position - reduce <= 15:
+                                saved.pop("entry_price", None)
+                    elif pnl_pct > self.TAKE_PROFIT_PCT:
+                        # Take profit: reduce 1/2 (was 1/3) – take more profit sooner
+                        reduce = min(position // 2, sell_cap)
+                        if reduce > 0:
+                            orders.append(self.order(best_bid, -reduce))
                 elif position < 0:
-                    r = -position
-                    for ask in sorted(depth.sell_orders):
-                        if r <= 0: break
-                        q = min(r, abs(depth.sell_orders[ask]))
-                        orders.append(self.order(ask, q))
-                        r -= q
-                    if r > 0: orders.append(self.order(best_ask, r))
-                # After exit, seek next dislocation
-                saved["phase"]     = "seek"
-                saved["direction"] = 0
+                    pnl_pct = (entry - mid) / entry
+                    if pnl_pct < -self.STOP_LOSS_PCT:
+                        reduce = min((-position) // 3, buy_cap)
+                        if reduce > 0:
+                            orders.append(self.order(best_ask, reduce))
+                            if -position - reduce <= 15:
+                                saved.pop("entry_price", None)
+                    elif pnl_pct > self.TAKE_PROFIT_PCT:
+                        reduce = min((-position) // 2, buy_cap)
+                        if reduce > 0:
+                            orders.append(self.order(best_ask, reduce))
+
+        # Soft position limit – looser
+        if abs(position) > self.MAX_POSITION:
+            reduce = min((abs(position) - self.MAX_POSITION) // 1, 
+                        sell_cap if position > 0 else buy_cap)
+            if reduce > 0:
+                if position > 0:
+                    orders.append(self.order(best_bid, -reduce))
+                else:
+                    orders.append(self.order(best_ask, reduce))
+
+        # Final unwind before expiry (same timing)
+        if ts >= self.MAX_TS - 3000:
+            if position > 0:
+                orders.append(self.order(best_bid, -position))
+            elif position < 0:
+                orders.append(self.order(best_ask, -position))
+
+        # Update saved state
+        saved["last_mid"] = mid
+        if under_mid:
+            saved["last_under"] = under_mid
 
         return orders, saved
 
-
+# ── STRATEGY REGISTRY ────────────────────────────────────────────────────────
 STRATEGIES: Dict[str, Strategy] = {
-    # "INTARIAN_PEPPER_ROOT": IntarianPepperRootStrategy("INTARIAN_PEPPER_ROOT", position_limit=80),
-    # "ASH_COATED_OSMIUM":    OsmiumStrategy("ASH_COATED_OSMIUM", position_limit=80),
-    # "HYDROGEL_PACK":        HydrogelStrategy(),
-    # "VELVETFRUIT_EXTRACT":  VelvetfruitStrategy(),
+    "HYDROGEL_PACK": HydrogelStrategy(),
+    "VELVETFRUIT_EXTRACT": VelvetfruitStrategy(),
+
     "VEV_4000": VEV_Strategy(4000),
     "VEV_4500": VEV_Strategy(4500),
     "VEV_5000": VEV_Strategy(5000),
@@ -673,12 +700,15 @@ STRATEGIES: Dict[str, Strategy] = {
 
 
 class Trader:
+
     def run(self, state: TradingState):
         try:
             saved = json.loads(state.traderData)
         except:
             saved = {}
+
         result = {}
+
         for product, strategy in STRATEGIES.items():
             if product not in state.order_depths:
                 continue
@@ -686,4 +716,5 @@ class Trader:
             orders, product_saved = strategy.get_orders(state, product_saved)
             result[product] = orders
             saved[product] = product_saved
+
         return result, 0, json.dumps(saved)
