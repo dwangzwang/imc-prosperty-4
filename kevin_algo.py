@@ -501,15 +501,32 @@ def fit_iv(mid, S, K, T):
 
 
 class VEV_Strategy(Strategy):
-    TOTAL_LIFE  = 8
-    CURRENT_DAY = 4
-    DUMP_TS     = 85_000
-    SKEW_DIV    = 40
-    TAKER_EDGE  = 2.0
-    MAKER_EDGE  = 1.0
-    IV_ALPHA    = 0.15
-    MR_WINDOW   = 30
-    MR_ALPHA    = 0.05
+    TOTAL_LIFE   = 8
+    CURRENT_DAY  = 4
+    DUMP_TS      = 85_000
+
+    # Cold start: do NOTHING for first WARMUP_TS timestamps.
+    # Let IV converge before touching any position.
+    WARMUP_TS    = 8_000
+
+    # During warmup, run IV solver at high alpha to bootstrap fast.
+    IV_ALPHA_HOT = 0.60    # First WARMUP_TS ticks: slam IV to market fast
+    IV_ALPHA     = 0.12    # After warmup: slow and stable
+
+    # Require IV to be observed at least MIN_IV_OBS times before trading.
+    MIN_IV_OBS   = 5
+
+    SKEW_DIV     = 40
+    TAKER_EDGE   = 2.5
+    MAKER_EDGE   = 1.0
+
+    # Mean reversion: z-score window and bias scaling
+    MR_WINDOW    = 25
+    MR_BIAS      = 1.2
+
+    # Staggered unwind: start reducing position at UNWIND_TS, not all at DUMP_TS
+    UNWIND_TS    = 65_000
+    UNWIND_FRAC  = 0.25    # Sell this fraction of position each unwind tick
 
     def __init__(self, strike):
         super().__init__(f"VEV_{strike}", position_limit=300)
@@ -518,60 +535,17 @@ class VEV_Strategy(Strategy):
     def _T(self, ts):
         return max(1e-6, ((self.TOTAL_LIFE - self.CURRENT_DAY) - ts/1_000_000) / self.TOTAL_LIFE)
 
-    def _mlr_fair(self, S, T, iv, saved):
-        # Rolling MLR: regress option mid on [BS(S,K,T,iv), S, iv] using
-        # exponentially weighted covariance update (no numpy, no matrices).
-        # State: means, variances, covariances of 3 features vs target.
-        # Prediction: fair = w0*bs + w1*S_dev + w2*iv_dev + intercept
-        # where deviations are from rolling means.
-        bs = bs_fair(S, self.K, T, iv)
-        feats = [bs, S, iv]
-
-        fm  = saved.get("fm",  [bs, S, iv])
-        fv  = saved.get("fv",  [1.0, 1.0, 0.001])
-        fcv = saved.get("fcv", [1.0, 0.0, 0.0])
-        tm  = saved.get("tm",  bs)
-        a   = self.MR_ALPHA
-
-        old_fm = fm[:]
-        old_tm = tm
-
-        for i in range(3):
-            fm[i] = (1-a)*fm[i] + a*feats[i]
-        tm = (1-a)*tm + a*bs
-
-        for i in range(3):
-            df = feats[i] - old_fm[i]
-            dt = bs     - old_tm
-            fv[i]  = (1-a)*fv[i]  + a*df*df
-            fcv[i] = (1-a)*fcv[i] + a*df*dt
-
-        saved["fm"]  = fm
-        saved["fv"]  = fv
-        saved["fcv"] = fcv
-        saved["tm"]  = tm
-
-        weights = [fcv[i] / max(fv[i], 1e-8) for i in range(3)]
-        pred = sum(weights[i] * (feats[i] - fm[i]) for i in range(3)) + tm
-        return pred, bs, weights
-
-    def _mr_signal(self, fair, saved):
-        # Rolling mean reversion: track residual of (market_mid - mlr_fair)
-        # z-score the residual against its rolling std.
-        # High positive z → market overpriced → short signal
-        # High negative z → market underpriced → long signal
-        buf = saved.get("mr_buf", [])
-        buf.append(fair)
-        if len(buf) > self.MR_WINDOW:
-            buf = buf[-self.MR_WINDOW:]
-        saved["mr_buf"] = buf
-        if len(buf) < 5:
-            return 0.0
+    def _zscore(self, val, saved):
+        buf = saved.get("mr", [])
+        buf.append(val)
+        if len(buf) > self.MR_WINDOW: buf = buf[-self.MR_WINDOW:]
+        saved["mr"] = buf
+        if len(buf) < 5: return 0.0
         n    = len(buf)
         mean = sum(buf) / n
         var  = sum((x-mean)**2 for x in buf) / n
         std  = math.sqrt(var) if var > 1e-10 else 1e-5
-        return (fair - mean) / std
+        return (val - mean) / std
 
     def get_orders(self, state, saved):
         vf = state.order_depths.get("VELVETFRUIT_EXTRACT")
@@ -593,25 +567,49 @@ class VEV_Strategy(Strategy):
         sell_cap = self.position_limit + position
         orders   = []
 
-        iv = saved.get("iv", 0.20)
+        # IV bootstrap: always run solver, use hot alpha during warmup
+        iv      = saved.get("iv", None)
+        iv_obs  = saved.get("iv_obs", 0)
         live_iv = fit_iv(mid, S, self.K, T)
-        if live_iv:
-            iv = self.IV_ALPHA * live_iv + (1 - self.IV_ALPHA) * iv
-        saved["iv"] = iv
 
-        mlr_fair, bs, weights = self._mlr_fair(S, T, iv, saved)
+        if live_iv is not None:
+            alpha = self.IV_ALPHA_HOT if ts < self.WARMUP_TS else self.IV_ALPHA
+            iv    = live_iv if iv is None else alpha*live_iv + (1-alpha)*iv
+            iv_obs += 1
 
-        resid = mid - mlr_fair
-        z     = self._mr_signal(resid, saved)
+        saved["iv"]     = iv
+        saved["iv_obs"] = iv_obs
 
-        delta = bs_delta(S, self.K, T, iv)
-        taker_edge = max(self.TAKER_EDGE, self.TAKER_EDGE / (1 - delta + 0.15))
-        taker_edge = min(taker_edge, 10.0)
+        # Cold start lockout: observe market, build IV, do not trade
+        if ts < self.WARMUP_TS or iv is None or iv_obs < self.MIN_IV_OBS:
+            return [], saved
 
-        mr_bias = z * 1.5
-        fair    = mlr_fair - mr_bias - (position / self.SKEW_DIV)
+        fair_bs = bs_fair(S, self.K, T, iv)
+        delta   = bs_delta(S, self.K, T, iv)
 
+        # Mean reversion z-score on residual (mid - BS fair)
+        resid = mid - fair_bs
+        z     = self._zscore(resid, saved)
+
+        # Fair = BS + MR bias + inventory skew
+        # Positive z means market is rich → shade fair down → we become sellers
+        fair  = fair_bs - z*self.MR_BIAS - (position / self.SKEW_DIV)
+
+        # Delta-adjusted taker edge: deep ITM needs more edge
+        t_edge = max(self.TAKER_EDGE, self.TAKER_EDGE / (1 - delta + 0.15))
+        t_edge = min(t_edge, 10.0)
+
+        # Staggered unwind: bleed position down gradually before dump
+        if ts >= self.UNWIND_TS:
+            unwind_qty = max(1, int(abs(position) * self.UNWIND_FRAC))
+            if position > 0:
+                orders.append(self.order(best_bid, -min(unwind_qty, sell_cap)))
+            elif position < 0:
+                orders.append(self.order(best_ask, min(unwind_qty, buy_cap)))
+
+        # Hard dump at DUMP_TS
         if ts >= self.DUMP_TS:
+            orders.clear()
             if position > 0:
                 r = position
                 for bid in sorted(depth.buy_orders, reverse=True):
@@ -630,18 +628,20 @@ class VEV_Strategy(Strategy):
                 if r > 0: orders.append(self.order(best_ask, r))
             return orders, saved
 
+        # Taker sweeps
         for ask in sorted(depth.sell_orders):
-            if ask >= fair - taker_edge or buy_cap <= 0: break
+            if ask >= fair - t_edge or buy_cap <= 0: break
             q = min(buy_cap, abs(depth.sell_orders[ask]))
             orders.append(self.order(ask, q))
             buy_cap -= q
 
         for bid in sorted(depth.buy_orders, reverse=True):
-            if bid <= fair + taker_edge or sell_cap <= 0: break
+            if bid <= fair + t_edge or sell_cap <= 0: break
             q = min(sell_cap, depth.buy_orders[bid])
             orders.append(self.order(bid, -q))
             sell_cap -= q
 
+        # Maker quotes
         maker_bid = math.floor(fair - self.MAKER_EDGE)
         maker_ask = math.ceil(fair  + self.MAKER_EDGE)
         maker_bid = min(maker_bid, best_ask - 1)
