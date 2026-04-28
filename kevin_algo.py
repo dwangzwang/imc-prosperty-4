@@ -508,50 +508,36 @@ def implied_vol_newton(price: float, S: float, K: float, T: float,
     return sigma if 0.001 < sigma < 5.0 else None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VEV OPTION STRATEGY v5 — Liquidity-Aware Spread Capture
+# VEV STRATEGY v6 — Zero Gates, Max Aggression, All Strikes
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# KEY FIXES OVER v4:
-#   1. Dead strike elimination: skip posting if spread < MIN_SPREAD (illiquid)
-#   2. ATM penalty: near-ATM strikes (5100-5300) get halved position limits
-#      and require wider spread before quoting — reduces adverse selection
-#   3. Taker edge reduced to 5 on liquid strikes (was 8, too conservative)
-#   4. Skew divisor split by strike class: ATM=15 (rotate fast), wings=25
-#   5. Minimum spread filter prevents earning nothing on 1-tick spreads
-
-# Strikes we actually attempt to trade
-ATM_STRIKES  = {5100, 5200, 5300}   # High gamma, tight spreads, dangerous
-WING_STRIKES = {4000, 4500, 5000, 5400, 5500, 6000, 6500}  # Wider spreads, safer
+# DIAGNOSIS: We were gating out all trades with min_spread filters and
+# conservative skew that rotated positions before spread could compound.
+#
+# FIXES:
+#   - No liquidity gate. Post on every strike every tick regardless of spread.
+#   - Skew is soft (SKEW_DIV=80) — we HOLD inventory and let spread compound
+#     instead of rotating out immediately after every fill.
+#   - Taker edge dropped to 3 — fire more often on dislocations.
+#   - Full 300 position limit deployed on every strike including 4000.
+#   - EMA tracks faster (alpha=0.35) to catch intraday option price drift.
+#   - Quote improvement: always try best_bid+1 / best_ask-1 first.
+#     Only fall back to joining best if spread is exactly 1 tick.
+#   - Dump at ts >= 85000 to avoid overnight theta bleed.
 
 class VEV_Strategy(Strategy):
     TOTAL_LIFE  = 8
     CURRENT_DAY = 4        # ← UPDATE EACH ROUND
 
-    EMA_A       = 0.15     # Slow EMA for taker dislocation reference
-
-    DUMP_TS     = 85_000   # Flatten all positions after this timestamp
-
-    # Per-class parameters (set in __init__ based on strike)
-    # ATM:  tighter skew (rotate fast), wider required spread, smaller size
-    # Wing: looser skew (hold longer), narrower required spread, full size
+    EMA_A       = 0.35     # Fast EMA — options drift hard intraday
+    SKEW_DIV    = 80       # Soft skew — hold inventory, let spread compound
+                           # At +300 position: only 3.75 tick shade
+    ARSON_EDGE  = 3        # Taker fires at 3-tick dislocation from EMA
+    DUMP_TS     = 85_000
 
     def __init__(self, strike: int):
         super().__init__(f"VEV_{strike}", position_limit=300)
         self.strike = strike
-        self.is_atm = strike in ATM_STRIKES
-
-        if self.is_atm:
-            self.skew_div    = 15    # Rotate inventory fast — ATM gamma is dangerous
-            self.min_spread  = 3     # Only quote if spread >= 3 ticks (earn something real)
-            self.arson_edge  = 6     # Taker fires on 6-tick dislocation
-            self.size_limit  = 150   # Half position limit — ATM adverse selection is high
-            self.quote_edge  = 1     # Extra ticks inside fair before quoting
-        else:
-            self.skew_div    = 25    # Hold wings longer — they move less
-            self.min_spread  = 2     # Quote if spread >= 2 ticks
-            self.arson_edge  = 5     # Taker fires on 5-tick dislocation
-            self.size_limit  = 300   # Full position limit
-            self.quote_edge  = 0     # Quote right at best bid+1 / best_ask-1
 
     def get_orders(self, state: TradingState, saved: dict) -> Tuple[List[Order], dict]:
         depth = state.order_depths.get(self.product)
@@ -560,20 +546,21 @@ class VEV_Strategy(Strategy):
 
         best_bid = max(depth.buy_orders)
         best_ask = min(depth.sell_orders)
-        mid      = (best_bid + best_ask) / 2
         spread   = best_ask - best_bid
+        mid      = (best_bid + best_ask) / 2
         position = state.position.get(self.product, 0)
         ts       = state.timestamp
-
-        # Cap effective position by size_limit (not position_limit)
-        buy_cap  = self.size_limit - position
-        sell_cap = self.size_limit + position
+        buy_cap  = self.position_limit - position
+        sell_cap = self.position_limit + position
         orders: List[Order] = []
 
-        # ── EMA mid ──────────────────────────────────────────────────────
+        # ── EMA fair value ────────────────────────────────────────────────
         ema = saved.get("ema", mid)
         ema = self.EMA_A * mid + (1 - self.EMA_A) * ema
         saved["ema"] = ema
+
+        # ── Skewed fair: soft inventory pressure ──────────────────────────
+        skewed = ema - (position / self.SKEW_DIV)
 
         # ══ END-OF-DAY DUMP ══════════════════════════════════════════════
         if ts >= self.DUMP_TS:
@@ -585,7 +572,7 @@ class VEV_Strategy(Strategy):
                     orders.append(self.order(bid, -qty))
                     remaining -= qty
                 if remaining > 0:
-                    orders.append(self.order(best_bid - 1, -remaining))
+                    orders.append(self.order(best_bid, -remaining))
             elif position < 0:
                 remaining = -position
                 for ask in sorted(depth.sell_orders):
@@ -594,55 +581,46 @@ class VEV_Strategy(Strategy):
                     orders.append(self.order(ask, qty))
                     remaining -= qty
                 if remaining > 0:
-                    orders.append(self.order(best_ask + 1, remaining))
+                    orders.append(self.order(best_ask, remaining))
             return orders, saved
 
         # ══ NORMAL MODE ══════════════════════════════════════════════════
 
-        # ── Liquidity gate: don't trade illiquid ticks ────────────────────
-        # If spread < min_spread we can't earn anything — skip entirely.
-        if spread < self.min_spread:
-            return [], saved
-
-        # ── Skewed mid ────────────────────────────────────────────────────
-        skew_ticks = position / self.skew_div
-        skewed_mid = mid - skew_ticks
-
-        # ── TAKER: extreme dislocations only ─────────────────────────────
-        if best_ask < ema - self.arson_edge and buy_cap > 0:
+        # ── TAKER: sweep hard dislocations ───────────────────────────────
+        if best_ask < skewed - self.ARSON_EDGE and buy_cap > 0:
             for ask in sorted(depth.sell_orders):
-                if ask >= ema - self.arson_edge or buy_cap <= 0:
+                if ask >= skewed - self.ARSON_EDGE or buy_cap <= 0:
                     break
                 qty = min(buy_cap, abs(depth.sell_orders[ask]))
                 orders.append(self.order(ask, qty))
                 buy_cap -= qty
 
-        elif best_bid > ema + self.arson_edge and sell_cap > 0:
+        elif best_bid > skewed + self.ARSON_EDGE and sell_cap > 0:
             for bid in sorted(depth.buy_orders, reverse=True):
-                if bid <= ema + self.arson_edge or sell_cap <= 0:
+                if bid <= skewed + self.ARSON_EDGE or sell_cap <= 0:
                     break
                 qty = min(sell_cap, depth.buy_orders[bid])
                 orders.append(self.order(bid, -qty))
                 sell_cap -= qty
 
-        # ── MAKER: post inside spread, inventory-skewed ───────────────────
-        # Improve the market by 1 tick on each side, then apply skew.
-        our_bid = math.floor(skewed_mid) - self.quote_edge
-        our_ask = math.ceil(skewed_mid)  + self.quote_edge
+        # ── MAKER: improve spread if possible, else join ──────────────────
+        if spread >= 2:
+            our_bid = best_bid + 1
+            our_ask = best_ask - 1
+        else:
+            our_bid = best_bid
+            our_ask = best_ask
 
-        # Never cross or touch the existing best — we must be passive
-        our_bid = min(our_bid, best_ask - 1)
+        # Apply soft inventory skew to quotes
+        skew_ticks = round(position / self.SKEW_DIV)
+        our_bid -= skew_ticks
+        our_ask -= skew_ticks
+
+        # Sanity: never cross
+        our_bid = max(1, min(our_bid, best_ask - 1))
         our_ask = max(our_ask, best_bid + 1)
-
-        # Must still earn at least min_spread/2 ticks on each side
-        half = self.min_spread // 2
-        our_bid = min(our_bid, math.floor(mid) - half)
-        our_ask = max(our_ask, math.ceil(mid)  + half)
-
         if our_bid >= our_ask:
             our_bid = our_ask - 1
-        if our_bid < 1:
-            our_bid = 1
 
         if buy_cap > 0:
             orders.append(self.order(our_bid, buy_cap))
